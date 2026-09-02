@@ -1,0 +1,56 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "gemini-personal-agent"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# ---------------------------------------------------------------------------
+# Durable Object: all state for this agent (history, memory, todos, plans,
+# skills, rollup summaries, tool-call logs, pending media-group buffer).
+# SQLite-backed so it works on the Free plan. Also uses DO alarms (for the
+# media-group/album debounce) - no extra config needed for that, alarms are
+# built into the storage API on SQLite-backed DOs at this compatibility date.
+# ---------------------------------------------------------------------------
+[[durable_objects.bindings]]
+name = "AGENT_DO"
+class_name = "AgentDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentDO"]
+
+# ---------------------------------------------------------------------------
+# Vectorize: long-term searchable memory (rollup summaries).
+# You must create this index BEFORE first deploy - see README section 2.
+# ---------------------------------------------------------------------------
+[[vectorize]]
+binding = "MEMORY_INDEX"
+index_name = "agent-memory"
+
+[[services]]
+binding = "HERMES_ROUTER"
+service = "gemini-hermes-router"
+
+# ---------------------------------------------------------------------------
+# Cron Trigger: due-todo wake-up + proactive wake-up slots + day-3 rollover.
+# Every 5 minutes is the shared tick for all three.
+# ---------------------------------------------------------------------------
+[triggers]
+crons = ["*/5 * * * *"]
+
+# ---------------------------------------------------------------------------
+# Non-secret configuration
+# ---------------------------------------------------------------------------
+[vars]
+AI_ROUTER_BASE_URL = "https://gemini-hermes-router.matghz24.workers.dev"
+
+# ---------------------------------------------------------------------------
+# Secrets (set with `wrangler secret put`, never commit real values)
+# ---------------------------------------------------------------------------
+# AI_ROUTER_PROXY_TOKEN   -> the PROXY_TOKEN secret from the router worker
+# TELEGRAM_BOT_TOKEN      -> token for THIS agent's own, separate bot
+# TELEGRAM_OWNER_CHAT_ID  -> your chat_id (only this chat gets responses)
+# TELEGRAM_WEBHOOK_SECRET -> optional, verified via Telegram's secret_token header
+# TAVILY_API_KEY          -> for web_search
+# FIRECRAWL_API_KEY       -> for web_extract
+# YOUTUBE_API_KEY         -> for get_latest_youtube_video (YouTube Data API v3, free)
+# SERPER_API_KEY          -> for find_images (Serper Images search)
