@@ -199,8 +199,9 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger }) {
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     let response;
+    const selectedModel = (await stub.getMeta("selected_chat_model")) || CHAT_MODEL;
     try {
-      response = await callChatCompletions(env, { model: CHAT_MODEL, messages, tools: allToolDefinitions() });
+      response = await callChatCompletions(env, { model: selectedModel, messages, tools: allToolDefinitions() });
     } catch (err) {
       loopError = err;
       break;

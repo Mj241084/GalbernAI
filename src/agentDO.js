@@ -187,8 +187,8 @@ export class AgentDO extends DurableObject {
   }
 
   async processTurnQueueInLoop() {
-    if (this._isProcessingQueue) return;
-    this._isProcessingQueue = true;
+    const acquired = this.acquireLock();
+    if (!acquired) return;
     try {
       while (true) {
         const next = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM turn_queue ORDER BY id ASC LIMIT 1`))[0];
@@ -210,9 +210,10 @@ export class AgentDO extends DurableObject {
             `🚨 <b>خطا در پردازش صف turn</b>\n<code>${String(err.message || err).slice(0, 400)}</code>`
           );
         }
+        this._lockedAt = Date.now();
       }
     } finally {
-      this._isProcessingQueue = false;
+      this.releaseLock();
     }
   }
 
@@ -234,6 +235,20 @@ export class AgentDO extends DurableObject {
     if (currentAlarm === null) {
       await this.ctx.storage.setAlarm(Date.now());
     }
+  }
+
+  // Helper to ensure Meta updates also refresh any internal variables if needed
+  getMeta(key) {
+    const row = rowsOf(this.ctx.storage.sql.exec(`SELECT value FROM kv_meta WHERE key = ?`, key))[0];
+    return row ? row.value : null;
+  }
+
+  setMeta(key, value) {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO kv_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+      key,
+      value
+    );
   }
 
   // -------------------------------------------------------------------
@@ -543,19 +558,6 @@ export class AgentDO extends DurableObject {
   // wizard state - all keyed by string, all reuse this one table)
   // -------------------------------------------------------------------
 
-  getMeta(key) {
-    const row = rowsOf(this.ctx.storage.sql.exec(`SELECT value FROM kv_meta WHERE key = ?`, key))[0];
-    return row ? row.value : null;
-  }
-
-  setMeta(key, value) {
-    this.ctx.storage.sql.exec(
-      `INSERT INTO kv_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-      key,
-      value
-    );
-  }
-
   // -------------------------------------------------------------------
   // Logs (new) - lets the agent's own tool-call history be inspected via
   // the /logs and /stats bot commands, the same way the router exposes
@@ -817,21 +819,14 @@ export class AgentDO extends DurableObject {
     for (const g of groups) {
       if (now - g.last_seen_at >= MEDIA_GROUP_DEBOUNCE_MS) {
         this.ctx.storage.sql.exec(`DELETE FROM pending_media_groups WHERE media_group_id = ?`, g.media_group_id);
-        try {
-          const items = JSON.parse(g.items);
-          await runAgentTurnLocked({
-            env: this.env,
-            ctx: { waitUntil: () => {} },
-            stub: this,
-            chatId: g.chat_id,
-            trigger: { kind: "user_message", text: g.caption || "", mediaRefs: items },
-          });
-        } catch (err) {
-          await sendOwnerAlert(
-            this.env,
-            `🚨 <b>خطا در پردازش آلبوم عکس/ویدیو</b>\n<code>${String(err.message || err).slice(0, 400)}</code>`
-          );
-        }
+        
+        // Push the album directly to the queue to ensure order and avoid lock bypasses
+        this.ctx.storage.sql.exec(
+          `INSERT INTO turn_queue (chat_id, trigger_json, created_at) VALUES (?,?,?)`,
+          g.chat_id,
+          JSON.stringify({ kind: "user_message", text: g.caption || "", mediaRefs: JSON.parse(g.items) }),
+          now
+        );
       } else {
         const readyAt = g.last_seen_at + MEDIA_GROUP_DEBOUNCE_MS;
         nextAlarmAt = nextAlarmAt ? Math.min(nextAlarmAt, readyAt) : readyAt;

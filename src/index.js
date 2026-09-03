@@ -23,6 +23,7 @@ const HELP_TEXT = `🤖 <b>دستیار شخصی</b>
 /addwakeup HH:MM &lt;موضوع&gt; — افزودن زمان بیدارباش جدید (مثال: <code>/addwakeup 08:30 شعر صبحگاهی</code>)
 /delwakeup &lt;id&gt; — حذف یک زمان بیدارباش
 /unlock — آزادسازی فوری قفل نوبت ایجنت
+/model — انتخاب مدل فعال چت از روتر به صورت زنده
 /notes [صفحه] — لیست پیج‌بندی‌شده‌ی یادداشت‌ها
 /memory — نمایش پروفایل حافظه‌ی فعلی
 /todos — لیست یادآوری‌های در انتظار
@@ -391,6 +392,11 @@ async function handleCommand(text, env, ctx, stub, chatId) {
         break;
       }
 
+      case "/model": {
+        await handleModelCommand(env, stub, chatId);
+        break;
+      }
+
       case "/logs":
         await sendMessage(env, chatId, await formatAgentLogs(stub, args));
         break;
@@ -478,6 +484,14 @@ async function handleNoteCallback(env, stub, callbackQuery) {
   const chatId = callbackQuery.message?.chat?.id;
   const messageId = callbackQuery.message?.message_id;
 
+  if (data.startsWith("agent_model:") && chatId && messageId) {
+    const selectedModel = data.split(":")[1];
+    await stub.setMeta("selected_chat_model", selectedModel);
+    await editMessage(env, chatId, messageId, `🎯 مدل فعال چت با موفقیت به <b>${escapeHtml(selectedModel)}</b> تغییر یافت.`);
+    await answerCallbackQuery(env, callbackQuery.id, `تغییر به ${selectedModel}`);
+    return;
+  }
+
   if (!data.startsWith("note:") || !chatId || !messageId) {
     await answerCallbackQuery(env, callbackQuery.id);
     return;
@@ -526,4 +540,40 @@ async function handleNoteCallback(env, stub, callbackQuery) {
   }
 
   await answerCallbackQuery(env, callbackQuery.id);
+}
+
+// ===========================================================================
+// Real-time model command handling
+// ===========================================================================
+async function handleModelCommand(env, stub, chatId) {
+  try {
+    const resp = await env.HERMES_ROUTER.fetch(`${env.AI_ROUTER_BASE_URL.replace(/\/+$/, "")}/v1/models`, {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${env.AI_ROUTER_PROXY_TOKEN}`,
+      },
+    });
+    if (!resp.ok) {
+      throw new Error(`روتر کد خطا برگرداند: ${resp.status}`);
+    }
+    const json = await resp.json();
+    const models = (json.data || []).map((m) => m.id);
+
+    const activeModel = (await stub.getMeta("selected_chat_model")) || "auto";
+
+    let text = `🎯 <b>انتخاب مدل فعال چت</b>\n`;
+    text += `مدل فعال فعلی: <code>${escapeHtml(activeModel)}</code>\n\n`;
+    text += `مدل‌های زیر به صورت زنده از روتر دریافت شدند. مایلید به کدام مدل سوییچ کنید؟`;
+
+    const inlineKeyboard = [];
+    models.forEach((modelName) => {
+      const isSelected = modelName === activeModel;
+      const label = isSelected ? `🔹 ${modelName} (انتخاب شده)` : modelName;
+      inlineKeyboard.push([{ text: label, callback_data: `agent_model:${modelName}` }]);
+    });
+
+    await sendMessage(env, chatId, text, { reply_markup: { inline_keyboard: inlineKeyboard } });
+  } catch (err) {
+    await sendMessage(env, chatId, `❌ خطا در برقراری ارتباط با روتر:\n<code>${escapeHtml(err.message || String(err))}</code>`);
+  }
 }
