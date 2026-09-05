@@ -136,7 +136,6 @@ export function proactiveThemePrompt(theme) {
 // ---------------------------------------------------------------------------
 
 export const NOTES_PAGE_SIZE = 8;
-export const TURN_LOCK_STALE_MS = 2 * 60 * 1000;
 
 export const TOOL_STATUS_TEXT = {
   web_search: "🔎 در حال جستجو در وب...",

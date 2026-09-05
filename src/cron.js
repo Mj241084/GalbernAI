@@ -27,7 +27,10 @@ async function checkDueTodos(env, ctx, stub) {
   for (const todo of due) {
     await stub.markTodoFired(todo.id);
     try {
-      await stub.enqueueTurn(env.TELEGRAM_OWNER_CHAT_ID, { kind: "todo_fired", todo });
+      await env.TURNS_QUEUE.send({
+        chatId: env.TELEGRAM_OWNER_CHAT_ID,
+        trigger: { kind: "todo_fired", todo },
+      });
     } catch (err) {
       await sendOwnerAlert(
         env,
@@ -69,7 +72,10 @@ async function checkProactiveWakeups(env, ctx, stub) {
     }
 
     try {
-      await stub.enqueueTurn(env.TELEGRAM_OWNER_CHAT_ID, { kind: "proactive_wake", theme: slot.theme });
+      await env.TURNS_QUEUE.send({
+        chatId: env.TELEGRAM_OWNER_CHAT_ID,
+        trigger: { kind: "proactive_wake", theme: slot.theme },
+      });
     } catch (err) {
       await sendOwnerAlert(env, `🚨 <b>خطا در بیدارباش خودکار (${slot.id})</b>\\n<code>${String(err.message || err).slice(0, 400)}</code>`);
     }

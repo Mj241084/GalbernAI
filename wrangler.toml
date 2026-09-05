@@ -31,6 +31,21 @@ binding = "HERMES_ROUTER"
 service = "gemini-hermes-router"
 
 # ---------------------------------------------------------------------------
+# Queues: serial execution of agent turns with up to 15m wall-clock timeout
+# ---------------------------------------------------------------------------
+[[queues.producers]]
+queue = "agent-turns"
+binding = "TURNS_QUEUE"
+
+[[queues.consumers]]
+queue = "agent-turns"
+max_batch_size = 1
+max_batch_timeout = 0
+max_retries = 2
+dead_letter_queue = "agent-turns-dlq"
+max_concurrency = 1
+
+# ---------------------------------------------------------------------------
 # Cron Trigger: due-todo wake-up + proactive wake-up slots + day-3 rollover.
 # Every 5 minutes is the shared tick for all three.
 # ---------------------------------------------------------------------------

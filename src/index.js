@@ -1,5 +1,6 @@
 import { AgentDO } from "./agentDO.js";
 import { handleScheduled } from "./cron.js";
+import { runAgentTurnLocked } from "./agentLoop.js";
 import { extractIncomingMedia, sendMessage, sendMarkdown, sendOwnerAlert, downloadTelegramFile, editMessage, answerCallbackQuery } from "./telegram.js";
 import { NOTES_PAGE_SIZE } from "./config.js";
 import { escapeHtml, safeJsonParse, base64ToUtf8Text } from "./util.js";
@@ -75,6 +76,27 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(handleScheduled(env, ctx, getStub));
+  },
+
+  async queue(batch, env) {
+    const stub = getStub(env);
+    for (const message of batch.messages) {
+      try {
+        await runAgentTurnLocked({
+          env,
+          ctx: { waitUntil: () => {} },
+          stub,
+          chatId: message.body.chatId,
+          trigger: message.body.trigger,
+        });
+      } catch (err) {
+        await sendOwnerAlert(
+          env,
+          `🚨 <b>خطا در پردازش turn از صف</b>\n<code>${escapeHtml(String(err.message || err)).slice(0, 400)}</code>`
+        );
+      }
+      message.ack();
+    }
   },
 };
 
@@ -173,7 +195,7 @@ async function handleWebhook(request, env, ctx) {
   }
 
   const mediaRefs = media ? [{ fileId: media.fileId, kind: media.kind, mimeType: media.mimeType }] : [];
-  await stub.enqueueTurn(chatId, { kind: "user_message", text, mediaRefs });
+  await env.TURNS_QUEUE.send({ chatId, trigger: { kind: "user_message", text, mediaRefs } });
 
   return new Response("ok");
 }
@@ -359,8 +381,7 @@ async function handleCommand(text, env, ctx, stub, chatId) {
       }
 
       case "/unlock": {
-        await stub.releaseLock();
-        await sendMessage(env, chatId, "🔓 قفل نوبت به صورت دستی آزادسازی شد.");
+        await sendMessage(env, chatId, "🔓 سیستم از Cloudflare Queue استفاده می‌کند و هم‌زمانی به صورت خودکار مدیریت می‌شود.");
         break;
       }
 

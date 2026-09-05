@@ -1,11 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { getDayWindow, shiftDayWindow } from "./util.js";
 import { MAX_LOG_ROWS } from "./config.js";
-import { runAgentTurnLocked } from "./agentLoop.js";
-import { sendOwnerAlert } from "./telegram.js";
 
 const MEDIA_GROUP_DEBOUNCE_MS = 1500;
-import { TURN_LOCK_STALE_MS } from "./config.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS messages (
@@ -119,13 +116,6 @@ CREATE TABLE IF NOT EXISTS notes (
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at);
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at);
 
-CREATE TABLE IF NOT EXISTS turn_queue (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chat_id TEXT NOT NULL,
-  trigger_json TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS media_cache (
   file_id TEXT PRIMARY KEY,
   base64 TEXT NOT NULL,
@@ -173,68 +163,6 @@ export class AgentDO extends DurableObject {
         this._notesFtsAvailable = false;
       }
     });
-  }
-
-  acquireLock() {
-    const now = Date.now();
-    if (this._lockedAt && now - this._lockedAt < TURN_LOCK_STALE_MS) return false;
-    this._lockedAt = now;
-    return true;
-  }
-
-  releaseLock() {
-    this._lockedAt = null;
-  }
-
-  async processTurnQueueInLoop() {
-    const acquired = this.acquireLock();
-    if (!acquired) return;
-    try {
-      while (true) {
-        const next = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM turn_queue ORDER BY id ASC LIMIT 1`))[0];
-        if (!next) break;
-        this.ctx.storage.sql.exec(`DELETE FROM turn_queue WHERE id = ?`, next.id);
-        let trigger;
-        try {
-          trigger = JSON.parse(next.trigger_json);
-          await runAgentTurnLocked({
-            env: this.env,
-            ctx: { waitUntil: () => {} },
-            stub: this,
-            chatId: next.chat_id,
-            trigger,
-          });
-        } catch (err) {
-          await sendOwnerAlert(
-            this.env,
-            `🚨 <b>خطا در پردازش صف turn</b>\n<code>${String(err.message || err).slice(0, 400)}</code>`
-          );
-        }
-        this._lockedAt = Date.now();
-      }
-    } finally {
-      this.releaseLock();
-    }
-  }
-
-  async enqueueTurn(chatId, trigger) {
-    this.ctx.storage.sql.exec(
-      `INSERT INTO turn_queue (chat_id, trigger_json, created_at) VALUES (?,?,?)`,
-      String(chatId),
-      JSON.stringify(trigger),
-      Date.now()
-    );
-    // Instant execution in same DO instance if idle
-    if (this.ctx && typeof this.ctx.waitUntil === "function") {
-      this.ctx.waitUntil(this.processTurnQueueInLoop().catch(() => {}));
-    } else {
-      this.processTurnQueueInLoop().catch(() => {});
-    }
-    // Backup fallback alarm
-    const currentAlarm = await this.ctx.storage.getAlarm();
-    if (currentAlarm === null) {
-      await this.ctx.storage.setAlarm(Date.now());
-    }
   }
 
   // Helper to ensure Meta updates also refresh any internal variables if needed
@@ -820,20 +748,17 @@ export class AgentDO extends DurableObject {
       if (now - g.last_seen_at >= MEDIA_GROUP_DEBOUNCE_MS) {
         this.ctx.storage.sql.exec(`DELETE FROM pending_media_groups WHERE media_group_id = ?`, g.media_group_id);
         
-        // Push the album directly to the queue to ensure order and avoid lock bypasses
-        this.ctx.storage.sql.exec(
-          `INSERT INTO turn_queue (chat_id, trigger_json, created_at) VALUES (?,?,?)`,
-          g.chat_id,
-          JSON.stringify({ kind: "user_message", text: g.caption || "", mediaRefs: JSON.parse(g.items) }),
-          now
-        );
+        if (this.env && this.env.TURNS_QUEUE) {
+          await this.env.TURNS_QUEUE.send({
+            chatId: g.chat_id,
+            trigger: { kind: "user_message", text: g.caption || "", mediaRefs: JSON.parse(g.items) },
+          });
+        }
       } else {
         const readyAt = g.last_seen_at + MEDIA_GROUP_DEBOUNCE_MS;
         nextAlarmAt = nextAlarmAt ? Math.min(nextAlarmAt, readyAt) : readyAt;
       }
     }
-
-    await this.processTurnQueueInLoop();
 
     if (nextAlarmAt) {
       await this.ctx.storage.setAlarm(nextAlarmAt);
