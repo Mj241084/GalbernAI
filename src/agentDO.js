@@ -133,6 +133,7 @@ export class AgentDO extends DurableObject {
     super(ctx, env);
     this.ctx = ctx;
     this.env = env;
+    this._mediaMemCache = new Map();
     this.ctx.blockConcurrencyWhile(async () => {
       for (const stmt of SCHEMA.split(";")) {
         const trimmed = stmt.trim();
@@ -184,9 +185,13 @@ export class AgentDO extends DurableObject {
   // -------------------------------------------------------------------
 
   getCachedMedia(fileId) {
+    const mem = this._mediaMemCache.get(fileId);
+    if (mem) return mem;
     const row = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM media_cache WHERE file_id = ?`, fileId))[0];
     if (!row) return null;
-    return { base64: row.base64, mimeType: row.mime_type };
+    const value = { base64: row.base64, mimeType: row.mime_type };
+    this._mediaMemCache.set(fileId, value);
+    return value;
   }
 
   setCachedMedia(fileId, base64, mimeType) {
@@ -197,6 +202,7 @@ export class AgentDO extends DurableObject {
       mimeType,
       Date.now()
     );
+    this._mediaMemCache.set(fileId, { base64, mimeType });
   }
 
   // -------------------------------------------------------------------

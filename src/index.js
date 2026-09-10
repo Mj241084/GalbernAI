@@ -7,9 +7,36 @@ import { escapeHtml, safeJsonParse, base64ToUtf8Text } from "./util.js";
 
 export { AgentDO };
 
-function getStub(env) {
+function freshStub(env) {
   const id = env.AGENT_DO.idFromName("global");
   return env.AGENT_DO.get(id);
+}
+
+// یک wrapper روی stub که اگه instance واقعی DO وسط کار عوض/evict بشه
+// (خطای "Connection closed... no longer active")، خودش به‌طور شفاف یک
+// stub تازه می‌گیره و همون فراخوانی رو دوباره امتحان می‌کنه - به‌جای این‌که
+// کل turn با یک throw ناگهانی نیمه‌کاره رها بشه.
+function getStub(env) {
+  let current = freshStub(env);
+  return new Proxy(
+    {},
+    {
+      get(_, prop) {
+        return async (...args) => {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              return await current[prop](...args);
+            } catch (err) {
+              const msg = String(err?.message || err);
+              const isStale = /no longer active|Connection closed/i.test(msg);
+              if (!isStale || attempt === 2) throw err;
+              current = freshStub(env);
+            }
+          }
+        };
+      },
+    }
+  );
 }
 
 const HELP_TEXT = `🤖 <b>دستیار شخصی</b>

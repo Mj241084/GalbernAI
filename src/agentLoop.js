@@ -10,10 +10,12 @@ import { StatusMessages } from "./StatusMessages.js";
 // ===========================================================================
 
 async function buildSystemPrompt(stub) {
-  const memoryProfile = await stub.getMemoryProfile();
-  const planBlock = await stub.renderPlanBlock();
-  const skills = await stub.listSkills();
-  const currentRollup = await stub.getCurrentRollup();
+  const [memoryProfile, planBlock, skills, currentRollup] = await Promise.all([
+    stub.getMemoryProfile(),
+    stub.renderPlanBlock(),
+    stub.listSkills(),
+    stub.getCurrentRollup(),
+  ]);
 
   const sections = [BASE_SYSTEM_PROMPT, currentTimeBlock()];
 
@@ -40,6 +42,23 @@ async function buildSystemPrompt(stub) {
 // History assembly (today + yesterday, media rehydrated inline)
 // ===========================================================================
 
+/**
+ * یک مدیا-رفرنس تلگرام رو به یک content part برای مدل تبدیل می‌کنه.
+ * ترتیب: اول کش حافظه (سریع‌ترین)، بعد کش SQLite، بعد دانلود از تلگرام.
+ * جدا نوشتنش (به‌جای این‌که مستقیم توی حلقه باشه) لازمه تا بشه با
+ * Promise.all چند عکس رو هم‌زمان resolve کرد.
+ */
+async function resolveMediaContentPart(env, stub, ref) {
+  let cached = await stub.getCachedMedia(ref.fileId);
+  if (!cached) {
+    const downloaded = await downloadTelegramFile(env, ref.fileId);
+    cached = { base64: downloaded.base64, mimeType: downloaded.mimeType };
+    await stub.setCachedMedia(ref.fileId, cached.base64, cached.mimeType);
+  }
+  if (!cached.mimeType.startsWith("image/")) return null;
+  return { type: "image_url", image_url: { url: `data:${cached.mimeType};base64,${cached.base64}` } };
+}
+
 async function buildHistoryMessages(stub, env) {
   const rows = await stub.getTodayAndYesterday();
   const messages = [];
@@ -48,25 +67,26 @@ async function buildHistoryMessages(stub, env) {
       const content = [];
       if (row.content) content.push({ type: "text", text: row.content });
       const mediaRefs = safeJsonParse(row.media_refs, []);
-      for (const ref of mediaRefs || []) {
-        try {
-          let cached = await stub.getCachedMedia(ref.fileId);
-          if (!cached) {
-            const downloaded = await downloadTelegramFile(env, ref.fileId);
-            cached = { base64: downloaded.base64, mimeType: downloaded.mimeType };
-            await stub.setCachedMedia(ref.fileId, cached.base64, cached.mimeType);
-          }
-          if (cached.mimeType.startsWith("image/")) {
-            content.push({ type: "image_url", image_url: { url: `data:${cached.mimeType};base64,${cached.base64}` } });
-          }
-        } catch (err) {
-          await sendOwnerAlert(
-            env,
-            `⚠️ <b>یک فایل رسانه‌ای در بازسازی تاریخچه رد شد</b>\nkind: ${ref.kind}\n<code>${String(err.message || err).slice(0, 300)}</code>`
-          );
-        }
+      if (mediaRefs && mediaRefs.length) {
+        const parts = await Promise.all(
+          mediaRefs.map((ref) =>
+            resolveMediaContentPart(env, stub, ref).catch(async (err) => {
+              await sendOwnerAlert(
+                env,
+                `⚠️ <b>یک فایل رسانه‌ای در بازسازی تاریخچه رد شد</b>
+kind: ${ref.kind}
+<code>${String(err.message || err).slice(0, 300)}</code>`
+              );
+              return null;
+            })
+          )
+        );
+        content.push(...parts.filter(Boolean));
       }
-      messages.push({ role: "user", content: content.length === 1 && content[0].type === "text" ? content[0].text : content });
+      messages.push({
+        role: "user",
+        content: content.length === 1 && content[0].type === "text" ? content[0].text : content,
+      });
     } else if (row.role === "assistant") {
       const msg = { role: "assistant", content: row.content || "" };
       const toolCalls = safeJsonParse(row.tool_calls, null);
@@ -156,6 +176,11 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger }) {
     const syntheticId = `todo_fired_${trigger.todo.id}_${Date.now()}`;
     stub.appendMessage({
       dayWindow: today,
+      role: "user",
+      content: "⏰ [یادآوری خودکار]",
+    });
+    stub.appendMessage({
+      dayWindow: today,
       role: "assistant",
       content: "",
       toolCalls: [{ id: syntheticId, type: "function", function: { name: "todo_check", arguments: "{}" } }],
@@ -171,6 +196,11 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger }) {
     const syntheticId = `proactive_${Date.now()}`;
     stub.appendMessage({
       dayWindow: today,
+      role: "user",
+      content: "⏰ [بیدارباش خودکار]",
+    });
+    stub.appendMessage({
+      dayWindow: today,
       role: "assistant",
       content: "",
       toolCalls: [{ id: syntheticId, type: "function", function: { name: "proactive_wake", arguments: "{}" } }],
@@ -180,7 +210,8 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger }) {
       role: "tool",
       toolCallId: syntheticId,
       toolName: "proactive_wake",
-      content: `⏰ الان یکی از زمان‌های بیدارشدن خودکاره. موضوعی که خودت برای این ساعت تعیین کرده بودی: «${trigger.theme}».\nبر همین اساس (با کمک web_search و/یا حافظه‌ی بلندمدت در صورت نیاز) تصمیم بگیر چیکار کنی؛ اگه چیزی برای گفتن پیدا کردی بفرست، وگرنه لازم نیست هرقیمتی پیام بدی.`,
+      content: `⏰ الان یکی از زمان‌های بیدارشدن خودکاره. موضوعی که خودت برای این ساعت تعیین کرده بودی: «${trigger.theme}».
+بر همین اساس (با کمک web_search و/یا حافظه‌ی بلندمدت در صورت نیاز) تصمیم بگیر چیکار کنی؛ اگه چیزی برای گفتن پیدا کردی بفرست، وگرنه لازم نیست هرقیمتی پیام بدی.`,
     });
   }
 
