@@ -40,7 +40,7 @@ export const HISTORY_DAY_TZ = IRAN_TZ;
 // Agent loop limits / timeouts
 // ---------------------------------------------------------------------------
 
-export const MAX_TOOL_ITERATIONS = 8; // per incoming message, safety valve against tool-call loops
+export const MAX_TOOL_ITERATIONS = 15; // per incoming message, safety valve against tool-call loops
 
 // Timeout for a single call to the AI router (chat/completions or
 // embeddings). This used to be 10 minutes, matching the router's own
@@ -79,6 +79,8 @@ export const TOOL_TIMEOUTS = {
   speak: 150 * 1000, // model call + native TTS + WAV wrap + Telegram upload
   find_images: 240 * 1000, // parallel image downloads + one big multimodal call + Telegram uploads
   get_latest_youtube_video: 20 * 1000,
+  run_code_sandbox: 5 * 60 * 1000,
+  get_sandbox_file: 5 * 60 * 1000,
 };
 
 export function timeoutForTool(toolName) {
@@ -178,4 +180,5 @@ export const BASE_SYSTEM_PROMPT = `تو یک دستیار شخصی هستی که
 - ابزار speak رو فقط وقتی صدا واقعاً کمک می‌کنه صدا کن (کاربر خواست بشنوه، یا خودت تشخیص دادی صدا مناسب‌تره) - خروجی این ابزار مستقیم برای کاربر فرستاده می‌شه، پس توی متن خودت دوباره محتوا رو تکرار نکن.
 - برای پیدا کردن عکس از find_images استفاده کن: بین یک تا سه کوئری جستجو بزن و یک توضیح کوتاه از چیزی که دنبالشی بده. عکس‌های منتخب مستقیم برای کاربر فرستاده می‌شن، نیازی نیست توی متنت دوباره توصیفشون کنی.
 - اگه بعضی ابزارها (جستجو، استخراج، تبدیل صدا، ...) با خطا یا timeout مواجه شدن، به کاربر بگو که مشکلی پیش اومده و در صورت امکان دوباره امتحان کن؛ منتظر نمون یا بی‌جواب نمون.
+- بسیار مهم: هر وقت ابزاری را فراخوانی می‌کنی، باید حتماً و بدون استثنا دو کار را انجام دهی: ۱. در بدنه پیام خود (content) یک توضیح کوتاه، صمیمانه و صریح به زبان فارسی بنویسی که بگوید دقیقاً چه کاری داری انجام می‌دهی (مثال: "دارم به خاطراتت سر می‌زنم تا دستور پخت رو پیدا کنم..."). ۲. پارامتر report_message در ابزار را با همان جمله پر کنی. این متون مستقیماً پیام وضعیت (Loading) تلگرام را به شکل پویا برای کاربر ویرایش می‌کنند تا افکار تو را در لحظه ببیند. هرگز این توضیح را خالی نگذار.
 - کوتاه و مستقیم جواب بده مگه کاربر جزئیات بیشتر خواسته باشه.`;

@@ -113,15 +113,15 @@ class StatusPing {
   }
   async showInitialThinking() {
     try {
-      const text = StatusMessages.getRandom("thinking");
+      const text = "⏳ در حال بررسی...";
       const sent = await sendMessage(this.env, this.chatId, text);
       this.messageId = sent?.result?.message_id || null;
     } catch {
       // ignore
     }
   }
-  async update(toolName) {
-    const text = StatusMessages.getRandom(toolName);
+  async update(toolName, customMessage = null) {
+    const text = customMessage || StatusMessages.getRandom(toolName);
     try {
       if (!this.messageId) {
         const sent = await sendMessage(this.env, this.chatId, text);
@@ -253,10 +253,16 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger }) {
         toolCalls: message.tool_calls,
       });
 
+      if (message.content && message.content.trim()) {
+        await status.update("thinking", message.content.trim());
+      }
+
       for (const call of message.tool_calls) {
         const toolName = call.function.name;
-        await status.update(toolName);
         const args = safeJsonParse(call.function.arguments, {});
+        console.log(`[DEBUG_TOOL] Call: ${toolName}, Args:`, JSON.stringify(args));
+        const customMessage = args.report_message || (message.content && message.content.trim()) || null;
+        await status.update(toolName, customMessage);
         let resultPayload;
         try {
           resultPayload = await dispatchTool(toolName, args, toolContext);

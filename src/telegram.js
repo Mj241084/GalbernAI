@@ -204,6 +204,25 @@ export async function sendPhoto(env, chatId, { base64, mimeType, caption }) {
   }
 }
 
+export async function sendDocument(env, chatId, { base64, mimeType, filename, caption }) {
+  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  if (caption) form.append("caption", caption);
+  form.append("document", new Blob([bytes], { type: mimeType || "application/octet-stream" }), filename || "file.bin");
+  try {
+    const resp = await fetch(`${TG_API(env.TELEGRAM_BOT_TOKEN)}/sendDocument`, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(Math.max(TELEGRAM_API_TIMEOUT_MS, 45000)),
+    });
+    return await resp.json().catch(() => null);
+  } catch (err) {
+    console.error("sendDocument failed:", err.message || err);
+    return null;
+  }
+}
+
 // Sends a photo by remote URL directly - Telegram fetches it server-side,
 // so no download/re-upload round-trip is needed. Used by find_images:
 // Serper's own imageUrl values are passed straight through.

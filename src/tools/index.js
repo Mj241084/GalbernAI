@@ -7,14 +7,34 @@ import * as skills from "./skills.js";
 import * as youtube from "./youtube.js";
 import * as images from "./images.js";
 import * as notes from "./notes.js";
+import * as sandbox from "./sandbox.js";
 import { timeoutForTool } from "../config.js";
 import { withTimeout } from "../util.js";
 import { sendOwnerAlert } from "../telegram.js";
 
-const MODULES = [todos, plan, memory, web, tts, skills, youtube, images, notes];
+const MODULES = [todos, plan, memory, web, tts, skills, youtube, images, notes, sandbox];
 
 export function allToolDefinitions() {
-  return MODULES.flatMap((m) => m.definitions);
+  const rawDefs = MODULES.flatMap((m) => m.definitions);
+  return rawDefs.map((def) => {
+    if (def.type !== "function" || !def.function || !def.function.parameters) {
+      return def;
+    }
+    const cloned = JSON.parse(JSON.stringify(def));
+    const params = cloned.function.parameters;
+    if (params.type === "object") {
+      params.properties = params.properties || {};
+      params.properties.report_message = {
+        type: "string",
+        description: "یک گزارش کوتاه و صمیمانه به زبان فارسی برای کاربر که بگوید همین الان در حال انجام چه بخشی از خواسته‌ی او به کمک این ابزار هستید تا به عنوان پیام وضعیت زنده در چت تلگرام به او نشان داده شود. مثال: 'دارم کدهای پایتون رو توی لینوکس امن اجرا می‌کنم تا نمودار رو برات بکشم...'"
+      };
+      params.required = params.required || [];
+      if (!params.required.includes("report_message")) {
+        params.required.push("report_message");
+      }
+    }
+    return cloned;
+  });
 }
 
 const NAME_TO_MODULE = new Map();

@@ -57,6 +57,8 @@ crons = ["*/5 * * * *"]
 # ---------------------------------------------------------------------------
 [vars]
 AI_ROUTER_BASE_URL = "https://gemini-hermes-router.matghz24.workers.dev"
+FREESTYLE_API_KEY = "JZWzJ3HveMckh9pd8cS4eu-6bmVved1QPxH7MUzGDkL5gZMb4xBMywWtcM5EvyQEmNU"
+FREESTYLE_VM_ID = "vm-e36d492ac99d4367b99f21afb41d62d2"
 
 # ---------------------------------------------------------------------------
 # Secrets (set with `wrangler secret put`, never commit real values)
