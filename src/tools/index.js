@@ -4,15 +4,15 @@ import * as memory from "./memory.js";
 import * as web from "./web.js";
 import * as tts from "./tts.js";
 import * as skills from "./skills.js";
-import * as youtube from "./youtube.js";
 import * as images from "./images.js";
 import * as notes from "./notes.js";
 import * as sandbox from "./sandbox.js";
+import * as vision from "./vision.js";
 import { timeoutForTool } from "../config.js";
 import { withTimeout } from "../util.js";
 import { sendOwnerAlert } from "../telegram.js";
 
-const MODULES = [todos, plan, memory, web, tts, skills, youtube, images, notes, sandbox];
+const MODULES = [todos, plan, memory, web, tts, skills, images, notes, sandbox, vision];
 
 export function allToolDefinitions() {
   const rawDefs = MODULES.flatMap((m) => m.definitions);
@@ -26,7 +26,8 @@ export function allToolDefinitions() {
       params.properties = params.properties || {};
       params.properties.report_message = {
         type: "string",
-        description: "یک گزارش کوتاه و صمیمانه به زبان فارسی برای کاربر که بگوید همین الان در حال انجام چه بخشی از خواسته‌ی او به کمک این ابزار هستید تا به عنوان پیام وضعیت زنده در چت تلگرام به او نشان داده شود. مثال: 'دارم کدهای پایتون رو توی لینوکس امن اجرا می‌کنم تا نمودار رو برات بکشم...'"
+        description:
+          "یک جمله‌ی کوتاه و صمیمانه به فارسی که دقیقاً بگه همین الان با این ابزار چیکار داری می‌کنی - عیناً همون جمله‌ای که توی content خودت هم نوشتی. این مستقیم پیام وضعیت زنده‌ی تلگرام کاربر می‌شه، پس هیچ‌وقت خالی نذارش. مثال: «دارم کدهای پایتون رو توی لینوکس امن اجرا می‌کنم تا نمودار رو برات بکشم...»"
       };
       params.required = params.required || [];
       if (!params.required.includes("report_message")) {
@@ -76,7 +77,7 @@ function logToolEvent(context, entry) {
  * never rejected - no error, no log line, just a frozen turn sitting on
  * whatever status message happened to be showing ("🔎 در حال جستجو...").
  * Individual tools now carry their OWN internal timeouts too (see
- * web.js, youtube.js, images.js), but this wrapper is the guarantee that
+ * web.js, images.js), but this wrapper is the guarantee that
  * NO current or future tool - including one that forgets its own
  * timeout - can hang the agent loop indefinitely. If withTimeout's race
  * is lost, the underlying promise may keep running in the background

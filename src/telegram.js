@@ -204,17 +204,17 @@ export async function sendPhoto(env, chatId, { base64, mimeType, caption }) {
   }
 }
 
-export async function sendDocument(env, chatId, { base64, mimeType, filename, caption }) {
-  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+export async function sendDocument(env, chatId, { base64, bytes, mimeType, filename, caption }) {
+  const docBytes = bytes || Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
   const form = new FormData();
   form.append("chat_id", String(chatId));
   if (caption) form.append("caption", caption);
-  form.append("document", new Blob([bytes], { type: mimeType || "application/octet-stream" }), filename || "file.bin");
+  form.append("document", new Blob([docBytes], { type: mimeType || "application/octet-stream" }), filename || "file.bin");
   try {
     const resp = await fetch(`${TG_API(env.TELEGRAM_BOT_TOKEN)}/sendDocument`, {
       method: "POST",
       body: form,
-      signal: AbortSignal.timeout(Math.max(TELEGRAM_API_TIMEOUT_MS, 45000)),
+      signal: AbortSignal.timeout(Math.max(TELEGRAM_API_TIMEOUT_MS, 90000)),
     });
     return await resp.json().catch(() => null);
   } catch (err) {
@@ -274,8 +274,8 @@ export function extractIncomingMedia(message) {
     const largest = message.photo[message.photo.length - 1];
     return { fileId: largest.file_id, kind: "image" };
   }
-  if (message.video) return { fileId: message.video.file_id, kind: "video" };
-  if (message.document) return { fileId: message.document.file_id, kind: "document", mimeType: message.document.mime_type };
+  if (message.video) return { fileId: message.video.file_id, kind: "video", mimeType: message.video.mime_type };
+  if (message.document) return { fileId: message.document.file_id, kind: "document", mimeType: message.document.mime_type, filename: message.document.file_name };
   return null;
 }
 

@@ -57,17 +57,16 @@ crons = ["*/5 * * * *"]
 # ---------------------------------------------------------------------------
 [vars]
 AI_ROUTER_BASE_URL = "https://gemini-hermes-router.matghz24.workers.dev"
-FREESTYLE_API_KEY = "JZWzJ3HveMckh9pd8cS4eu-6bmVved1QPxH7MUzGDkL5gZMb4xBMywWtcM5EvyQEmNU"
-FREESTYLE_VM_ID = "vm-e36d492ac99d4367b99f21afb41d62d2"
 
 # ---------------------------------------------------------------------------
 # Secrets (set with `wrangler secret put`, never commit real values)
 # ---------------------------------------------------------------------------
+# FREESTYLE_API_KEY       -> your Freestyle.sh API key secret
 # AI_ROUTER_PROXY_TOKEN   -> the PROXY_TOKEN secret from the router worker
 # TELEGRAM_BOT_TOKEN      -> token for THIS agent's own, separate bot
 # TELEGRAM_OWNER_CHAT_ID  -> your chat_id (only this chat gets responses)
 # TELEGRAM_WEBHOOK_SECRET -> optional, verified via Telegram's secret_token header
 # TAVILY_API_KEY          -> for web_search
 # FIRECRAWL_API_KEY       -> for web_extract
-# YOUTUBE_API_KEY         -> for get_latest_youtube_video (YouTube Data API v3, free)
+# YOUTUBE_API_KEY         -> removed
 # SERPER_API_KEY          -> for find_images (Serper Images search)

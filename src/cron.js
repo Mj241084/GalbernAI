@@ -133,6 +133,7 @@ async function checkRollover(env, ctx, stub) {
     return;
   }
 
+  const vectorId = crypto.randomUUID();
   const rollupRecord = await stub.setCurrentRollup({ coversFromDay, coversToDay: boundary, summary: summaryText, vectorId });
   const rollupId = rollupRecord?.id || null;
 

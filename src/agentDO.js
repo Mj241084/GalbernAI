@@ -122,6 +122,18 @@ CREATE TABLE IF NOT EXISTS media_cache (
   mime_type TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS sandboxes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT UNIQUE NOT NULL,
+  vm_id TEXT NOT NULL,
+  description TEXT,
+  is_main INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_main ON sandboxes(is_main) WHERE is_main = 1;
 `;
 
 function rowsOf(cursor) {
@@ -177,6 +189,22 @@ export class AgentDO extends DurableObject {
       `INSERT INTO kv_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
       key,
       value
+    );
+  }
+
+  wasDedupeKeySeen(key) {
+    const fullKey = `dedupe:${key}`;
+    const row = rowsOf(this.ctx.storage.sql.exec(`SELECT value FROM kv_meta WHERE key = ?`, fullKey))[0];
+    return !!row;
+  }
+
+  markDedupeKeySeen(key) {
+    const fullKey = `dedupe:${key}`;
+    const now = String(Date.now());
+    this.ctx.storage.sql.exec(
+      `INSERT INTO kv_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+      fullKey,
+      now
     );
   }
 
@@ -257,6 +285,9 @@ export class AgentDO extends DurableObject {
 
   deleteMessagesOlderThan(boundaryDayInclusive) {
     this.ctx.storage.sql.exec(`DELETE FROM messages WHERE day_window <= ?`, boundaryDayInclusive);
+    // Cleanup cached media older than 4 days to prevent DO storage leaks
+    const fourDaysAgo = Date.now() - 4 * 24 * 60 * 60 * 1000;
+    this.ctx.storage.sql.exec(`DELETE FROM media_cache WHERE created_at < ?`, fourDaysAgo);
   }
 
   // -------------------------------------------------------------------
@@ -769,5 +800,48 @@ export class AgentDO extends DurableObject {
     if (nextAlarmAt) {
       await this.ctx.storage.setAlarm(nextAlarmAt);
     }
+  }
+
+  // -------------------------------------------------------------------
+  // Sandboxes
+  // -------------------------------------------------------------------
+
+  listSandboxes({ enabledOnly = true } = {}) {
+    return enabledOnly
+      ? rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM sandboxes WHERE enabled = 1 ORDER BY code ASC`))
+      : rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM sandboxes ORDER BY code ASC`));
+  }
+
+  getSandboxByCode(code) {
+    return rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM sandboxes WHERE code = ?`, code))[0] || null;
+  }
+
+  getMainSandbox() {
+    return rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM sandboxes WHERE is_main = 1 LIMIT 1`))[0] || null;
+  }
+
+  addSandbox({ code, vmId, description = null, enabled = true }) {
+    if (!code || !vmId) throw new Error("code و vmId هر دو لازمن");
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO sandboxes (code, vm_id, description, is_main, enabled, created_at, updated_at)
+       VALUES (?,?,?,0,?,?,?)
+       ON CONFLICT(code) DO UPDATE SET vm_id=excluded.vm_id, description=excluded.description, enabled=excluded.enabled, updated_at=excluded.updated_at`,
+      code, vmId, description, enabled ? 1 : 0, now, now
+    );
+    return this.getSandboxByCode(code);
+  }
+
+  setMainSandbox(code) {
+    const target = this.getSandboxByCode(code);
+    if (!target) throw new Error(`سندباکسی با کد «${code}» ثبت نشده.`);
+    this.ctx.storage.sql.exec(`UPDATE sandboxes SET is_main = 0 WHERE is_main = 1`);
+    this.ctx.storage.sql.exec(`UPDATE sandboxes SET is_main = 1, updated_at = ? WHERE code = ?`, Date.now(), code);
+    return this.getSandboxByCode(code);
+  }
+
+  deleteSandbox(code) {
+    this.ctx.storage.sql.exec(`DELETE FROM sandboxes WHERE code = ?`, code);
+    return { deleted: true };
   }
 }

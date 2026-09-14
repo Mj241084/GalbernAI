@@ -51,6 +51,12 @@ const HELP_TEXT = `🤖 <b>دستیار شخصی</b>
 /addwakeup HH:MM &lt;موضوع&gt; — افزودن زمان بیدارباش جدید (مثال: <code>/addwakeup 08:30 شعر صبحگاهی</code>)
 /delwakeup &lt;id&gt; — حذف یک زمان بیدارباش
 /unlock — آزادسازی فوری قفل نوبت ایجنت
+/sandboxes — لیست همه سندباکس‌های ثبت‌شده
+/addsandbox <code> <vm_id> [توضیح...] — ثبت یک سندباکس جدید
+/setmainsandbox <code> — تعیین سندباکس پیش‌فرض/اصلی
+/delsandbox <code> — حذف یک سندباکس
+/enablesandbox <code> — فعال‌سازی مجدد یک سندباکس
+/disablesandbox <code> — غیرفعال‌سازی موقت یک سندباکس
 /model — انتخاب مدل فعال چت از روتر به صورت زنده
 /notes [صفحه] — لیست پیج‌بندی‌شده‌ی یادداشت‌ها
 /memory — نمایش پروفایل حافظه‌ی فعلی
@@ -105,16 +111,17 @@ export default {
     ctx.waitUntil(handleScheduled(env, ctx, getStub));
   },
 
-  async queue(batch, env) {
+  async queue(batch, env, ctx) {
     const stub = getStub(env);
     for (const message of batch.messages) {
       try {
         await runAgentTurnLocked({
           env,
-          ctx: { waitUntil: () => {} },
+          ctx,
           stub,
           chatId: message.body.chatId,
           trigger: message.body.trigger,
+          dedupeKey: message.body.dedupeKey,
         });
       } catch (err) {
         await sendOwnerAlert(
@@ -222,7 +229,12 @@ async function handleWebhook(request, env, ctx) {
   }
 
   const mediaRefs = media ? [{ fileId: media.fileId, kind: media.kind, mimeType: media.mimeType }] : [];
-  await env.TURNS_QUEUE.send({ chatId, trigger: { kind: "user_message", text, mediaRefs } });
+  const messageId = message.message_id;
+  await env.TURNS_QUEUE.send({
+    chatId,
+    trigger: { kind: "user_message", text, mediaRefs },
+    dedupeKey: messageId ? `tg:${chatId}:${messageId}` : undefined,
+  });
 
   return new Response("ok");
 }
@@ -398,6 +410,79 @@ async function handleCommand(text, env, ctx, stub, chatId) {
         }
         await stub.deleteWakeSlot(id);
         await sendMessage(env, chatId, `🗑 بیدارباش [${id}] حذف شد.`);
+        break;
+      }
+
+      case "/sandboxes": {
+        const list = await stub.listSandboxes({ enabledOnly: false });
+        if (!list.length) {
+          await sendMessage(env, chatId, "هیچ سندباکسی ثبت نشده است.");
+        } else {
+          const body = list.map((s) => `${s.enabled ? "✅" : "⛔"} ${s.is_main ? "⭐ " : ""}<b>${escapeHtml(s.code)}</b> (vm: <code>${escapeHtml(s.vm_id)}</code>)\n${escapeHtml(s.description || "بدون توضیح")}`).join("\n\n");
+          await sendMessage(env, chatId, body);
+        }
+        break;
+      }
+
+      case "/addsandbox": {
+        const match = restOfFirstLine.match(/^(\S+)\s+(\S+)(?:\s+(.+))?$/s);
+        if (!match) {
+          await sendMessage(env, chatId, "فرمت درست:\n<code>/addsandbox code vm_id [توضیحات...]</code>\nمثال: <code>/addsandbox main vm-1234 کارهای محاسباتی من</code>");
+          break;
+        }
+        const [, code, vmId, description] = match;
+        const s = await stub.addSandbox({ code, vmId, description: description || null });
+        await sendMessage(env, chatId, `✅ سندباکس <b>${escapeHtml(s.code)}</b> با vm_id <code>${escapeHtml(s.vm_id)}</code> ثبت شد.`);
+        break;
+      }
+
+      case "/setmainsandbox": {
+        if (!restOfFirstLine) {
+          await sendMessage(env, chatId, "فرمت درست:\n<code>/setmainsandbox code</code>");
+          break;
+        }
+        const s = await stub.setMainSandbox(restOfFirstLine);
+        await sendMessage(env, chatId, `⭐ سندباکس <b>${escapeHtml(s.code)}</b> به عنوان سندباکس اصلی تعیین شد.`);
+        break;
+      }
+
+      case "/delsandbox": {
+        if (!restOfFirstLine) {
+          await sendMessage(env, chatId, "فرمت درست:\n<code>/delsandbox code</code>");
+          break;
+        }
+        await stub.deleteSandbox(restOfFirstLine);
+        await sendMessage(env, chatId, `🗑 سندباکس <b>${escapeHtml(restOfFirstLine)}</b> حذف شد.`);
+        break;
+      }
+
+      case "/enablesandbox": {
+        if (!restOfFirstLine) {
+          await sendMessage(env, chatId, "فرمت درست:\n<code>/enablesandbox code</code>");
+          break;
+        }
+        const existing = await stub.getSandboxByCode(restOfFirstLine);
+        if (!existing) {
+          await sendMessage(env, chatId, `سندباکسی با کد ${escapeHtml(restOfFirstLine)} پیدا نشد.`);
+          break;
+        }
+        await stub.addSandbox({ code: existing.code, vmId: existing.vm_id, description: existing.description, enabled: true });
+        await sendMessage(env, chatId, `✅ سندباکس <b>${escapeHtml(restOfFirstLine)}</b> فعال شد.`);
+        break;
+      }
+
+      case "/disablesandbox": {
+        if (!restOfFirstLine) {
+          await sendMessage(env, chatId, "فرمت درست:\n<code>/disablesandbox code</code>");
+          break;
+        }
+        const existing = await stub.getSandboxByCode(restOfFirstLine);
+        if (!existing) {
+          await sendMessage(env, chatId, `سندباکسی با کد ${escapeHtml(restOfFirstLine)} پیدا نشد.`);
+          break;
+        }
+        await stub.addSandbox({ code: existing.code, vmId: existing.vm_id, description: existing.description, enabled: false });
+        await sendMessage(env, chatId, `⛔ سندباکس <b>${escapeHtml(restOfFirstLine)}</b> غیرفعال شد.`);
         break;
       }
 
@@ -605,7 +690,9 @@ async function handleModelCommand(env, stub, chatId) {
       throw new Error(`روتر کد خطا برگرداند: ${resp.status}`);
     }
     const json = await resp.json();
-    const models = (json.data || []).map((m) => m.id);
+    const models = (json.data || [])
+      .filter((m) => !m.kind || m.kind === "chat")
+      .map((m) => m.id);
 
     const activeModel = (await stub.getMeta("selected_chat_model")) || "auto";
 

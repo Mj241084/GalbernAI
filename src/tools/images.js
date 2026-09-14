@@ -8,6 +8,7 @@ import {
 import { callChatCompletions } from "../aiRouter.js";
 import { sendPhotoByUrl, sendOwnerAlert } from "../telegram.js";
 import { safeJsonParse, fetchImageAsDataUri } from "../util.js";
+import { freestyleWriteFile } from "../freestyleClient.js";
 
 async function serperImageSearch(env, query, num) {
   let resp;
@@ -44,7 +45,7 @@ export const definitions = [
     function: {
       name: "find_images",
       description:
-        "Search the web for images matching a description, have a vision model filter the candidates, and send the best matches directly to the user. Use 1-3 differently-worded queries to widen coverage.",
+        "Search the web for images matching a description, have a vision model filter the candidates, and send the best matches directly to the user or save them to the sandbox. Use 1-3 differently-worded queries to widen coverage.",
       parameters: {
         type: "object",
         properties: {
@@ -52,6 +53,11 @@ export const definitions = [
           description: {
             type: "string",
             description: "What you're actually looking for - used to filter which candidate images actually match.",
+          },
+          destination: {
+            type: "string",
+            enum: ["user", "sandbox"],
+            description: "Target destination for the images: 'user' to send directly to Telegram chat, or 'sandbox' to save them under /home/ubuntu/uploads/images/<query>/ directory on the main sandbox. Defaults to 'user'.",
           },
         },
         required: ["queries", "description"],
@@ -69,9 +75,12 @@ export const definitions = [
 // If it turns out unreliable in practice, the fix is localized to the loop
 // below that builds `messages`: download each candidate + base64-encode it
 // (same pattern as agentLoop.js's history rehydration) before sending.
-export async function execute(name, args, { env, chatId }) {
+export async function execute(name, args, toolContext) {
   if (name !== "find_images") throw new Error(`unknown images tool: ${name}`);
+  const { env, chatId, stub } = toolContext;
   if (!env.SERPER_API_KEY) return { ok: false, error: "SERPER_API_KEY تنظیم نشده." };
+
+  const destination = args.destination === "sandbox" ? "sandbox" : "user";
 
   const rawQueries = Array.isArray(args.queries) ? args.queries : [args.queries];
   const queries = rawQueries.filter((q) => typeof q === "string" && q.trim()).slice(0, MAX_IMAGE_QUERIES);
@@ -156,6 +165,42 @@ export async function execute(name, args, { env, chatId }) {
 
   const selected = validCandidates.filter((c) => selectedIds.includes(c.id)).slice(0, MAX_IMAGES_TO_SEND);
 
+  if (destination === "sandbox") {
+    if (!stub) return { ok: false, error: "دسترسی به Durable Object ثبت نشده است." };
+    const mainSandbox = await stub.getMainSandbox();
+    if (!mainSandbox) return { ok: false, error: "هیچ سندباکس اصلی تعریف نشده است." };
+
+    const savedPaths = [];
+    for (const img of selected) {
+      try {
+        const cleanQuery = (img.query || "default").replace(/[^\w\d\u0600-\u06FF_-]/g, "_");
+        const base64Data = img.dataUri.split(",")[1];
+        if (!base64Data) continue;
+        const binaryString = atob(base64Data);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        const extMatch = img.dataUri.match(/data:image\/(\w+);/);
+        const ext = extMatch ? extMatch[1] : "jpg";
+        const filePath = `/home/ubuntu/uploads/images/${cleanQuery}/${img.id}_${Date.now()}.${ext}`;
+        await freestyleWriteFile(env, mainSandbox.vm_id, filePath, bytes);
+        savedPaths.push(filePath);
+      } catch (err) {
+        console.error(`Failed to save image ${img.id} to sandbox:`, err);
+      }
+    }
+
+    return {
+      ok: true,
+      destination: "sandbox",
+      found: candidates.length,
+      selected: selected.length,
+      saved_paths: savedPaths,
+      ...(queryErrors.length ? { partial_query_errors: queryErrors } : {}),
+    };
+  }
+
   for (const img of selected) {
     try {
       await sendPhotoByUrl(env, chatId, { url: img.imageUrl, caption: img.title ? img.title.slice(0, 900) : undefined });
@@ -166,6 +211,7 @@ export async function execute(name, args, { env, chatId }) {
 
   return {
     ok: true,
+    destination: "user",
     found: candidates.length,
     selected: selected.length,
     selected_titles: selected.map((s) => s.title).filter(Boolean),
