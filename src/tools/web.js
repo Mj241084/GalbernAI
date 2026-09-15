@@ -12,7 +12,7 @@ export const definitions = [
         type: "object",
         properties: {
           query: { type: "string" },
-          max_results: { type: "integer", description: "Default 5." },
+          max_results: { type: "integer", description: "Default 7." },
         },
         required: ["query"],
       },
@@ -37,7 +37,7 @@ export const definitions = [
 // with no error and no log line - freezing the entire agent turn on the
 // "🔎 در حال جستجو..." status message. This is the confirmed root cause of
 // turns that never responded. Same fix applied to firecrawlExtract below.
-async function tavilySearch(env, query, maxResults = 5) {
+async function tavilySearch(env, query, maxResults = 7) {
   let resp;
   try {
     resp = await fetch("https://api.tavily.com/search", {
@@ -103,7 +103,7 @@ async function firecrawlExtract(env, url) {
 export async function execute(name, args, { env }) {
   switch (name) {
     case "web_search": {
-      const results = await tavilySearch(env, args.query, args.max_results);
+      const results = await tavilySearch(env, args.query, args.max_results || 7);
       return { ok: true, results };
     }
     case "web_extract": {

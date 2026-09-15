@@ -113,7 +113,7 @@ async function buildHistoryMessages(stub, env) {
                 env,
                 `⚠️ <b>یک فایل رسانه‌ای در بازسازی تاریخچه رد شد</b>
 kind: ${ref.kind}
-<code>${String(err.message || err).slice(0, 300)}</code>`
+<code>${String(err.message || err).slice(0, 1000)}</code>`
               );
               return null;
             })
@@ -206,7 +206,7 @@ class StatusPing {
 
   _logFailure(result) {
     try {
-      const p = this.stub.appendLog({ kind: "status_ping", status: "error", detail: JSON.stringify(result).slice(0, 300) });
+      const p = this.stub.appendLog({ kind: "status_ping", status: "error", detail: JSON.stringify(result).slice(0, 1000) });
       if (p?.catch) p.catch(() => {});
     } catch {}
   }
@@ -233,7 +233,7 @@ function logSafe(stub, entry) {
 
 function fallbackReport(toolName, args) {
   if (!args) return null;
-  if (toolName === "run_code_sandbox") return `کد ${args.language || "python"}: ${(args.code || "").slice(0, 60)}...`;
+  if (toolName === "run_code_sandbox") return `کد ${args.language || "python"}: ${(args.code || "").slice(0, 1000)}...`;
   if (toolName === "web_search") return `جستجو: ${args.query || ""}`;
   if (toolName === "web_extract") return `استخراج: ${args.url || ""}`;
   if (toolName === "get_sandbox_file") return `فایل: ${args.path || ""}`;
@@ -481,7 +481,7 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger, dedu
         const args = safeJsonParse(rawArgs, undefined);
 
         if (args === undefined) {
-          await sendOwnerAlert(env, `🚨 JSON نامعتبر در آرگومان "${toolName}"\n<code>${escapeHtml((rawArgs || "").slice(0, 500))}</code>`);
+          await sendOwnerAlert(env, `🚨 JSON نامعتبر در آرگومان "${toolName}"\n<code>${escapeHtml((rawArgs || "").slice(0, 1000))}</code>`);
           await status.update(toolName, "⚠️ خطا در دریافت آرگومان‌ها از مدل");
           const errResult = { ok: false, error: "آرگومان‌های ارسالی قابل parse نبودند، دوباره تلاش کن." };
           const resultText = JSON.stringify(errResult);
@@ -533,12 +533,12 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger, dedu
     logSafe(stub, {
       kind: "turn_error",
       status: "error",
-      detail: String(loopError.message || loopError).slice(0, 500),
+      detail: String(loopError.message || loopError).slice(0, 1000),
       latencyMs: Date.now() - turnStartedAt,
     });
     await sendOwnerAlert(
       env,
-      `🚨 <b>خطا در فراخوانی AI router از agent</b>\n<code>${escapeHtml(String(loopError.message || loopError)).slice(0, 500)}</code>`
+      `🚨 <b>خطا در فراخوانی AI router از agent</b>\n<code>${escapeHtml(String(loopError.message || loopError)).slice(0, 1000)}</code>`
     );
     if (trigger.kind === "user_message") {
       await sendMessage(env, chatId, "یک مشکل فنی پیش اومد، دوباره امتحان کن.");
