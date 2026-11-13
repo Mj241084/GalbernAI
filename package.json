@@ -2,8 +2,10 @@
   "name": "gemini-personal-agent",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Personal Telegram agent (Cloudflare Worker) - talks to gemini-hermes-router for all AI calls, has its own memory/todo/plan system.",
   "scripts": {
+    "test": "node tests/runTests.js",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail"

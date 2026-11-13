@@ -36,8 +36,14 @@ export function formatHumanDateTime(nowMs, timeZone) {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
+    hourCycle: "h23",
   });
   return fmt.format(nowMs);
+}
+
+export function formatMessageTimestamp(ts) {
+  const ms = Number.isFinite(ts) ? ts : Date.now();
+  return `[🕒 ایران: ${formatHumanDateTime(ms, IRAN_TZ)} | آمریکا: ${formatHumanDateTime(ms, US_REFERENCE_TZ)}]`;
 }
 
 // Both clock anchors injected into the system prompt every turn.
@@ -106,16 +112,6 @@ export function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
-export async function fetchImageAsDataUri(url, timeoutMs) {
-  const resp = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const contentType = resp.headers.get("content-type") || "";
-  if (!contentType.startsWith("image/")) throw new Error(`not an image: ${contentType}`);
-  const buf = await resp.arrayBuffer();
-  const base64 = bytesToBase64(new Uint8Array(buf));
-  return `data:${contentType};base64,${base64}`;
-}
-
 export function escapeHtml(str) {
   return String(str ?? "")
     .replace(/&/g, "&amp;")
@@ -156,4 +152,105 @@ export function base64ToBytes(base64) {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
+}
+
+// ---------------------------------------------------------------------------
+// Line-numbered viewing & safe patching (notes & memory profile)
+// ---------------------------------------------------------------------------
+
+export function formatNumberedLines(text) {
+  if (!text) return "";
+  return String(text)
+    .split("\n")
+    .map((line, idx) => `${idx + 1} | ${line}`)
+    .join("\n");
+}
+
+function assertNoNumberPrefixLeak(text, fieldName) {
+  if (!text) return;
+  const lines = String(text).split("\n");
+  if (lines.length >= 2 && lines.every((l) => !l.trim() || /^\s*\d+\s*\|/.test(l))) {
+    throw new Error(
+      `پیشوند شماره خط ("1 | ") داخل ${fieldName} فرستاده شده. شماره خط فقط برای خواندن است؛ متن خالص بدون "N | " بفرست.`
+    );
+  }
+}
+
+/**
+ * Applies a list of patch operations atomically to `originalText`.
+ * Each op is either:
+ *   1) { old_text, new_text }  (exact unique match, Claude Code str_replace style)
+ *   2) { start_line, end_line, expected_first_line, new_text } (1-based inclusive line range + anchor guard)
+ */
+export function applySafePatches(originalText, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    throw new Error("حداقل یک عملیات ویرایش (patch) لازم است.");
+  }
+  let current = String(originalText ?? "");
+  let lastEditCenterLine = 1;
+
+  for (const op of ops) {
+    assertNoNumberPrefixLeak(op.new_text, "new_text");
+
+    if (op.old_text !== undefined) {
+      assertNoNumberPrefixLeak(op.old_text, "old_text");
+      const needle = String(op.old_text);
+      if (!needle) throw new Error("old_text نمی‌تواند خالی باشد.");
+      const firstIdx = current.indexOf(needle);
+      if (firstIdx === -1) {
+        throw new Error(`old_text در متن پیدا نشد. اول متن جدید را بخوان و دقیقاً کپی کن.`);
+      }
+      const secondIdx = current.indexOf(needle, firstIdx + 1);
+      if (secondIdx !== -1) {
+        throw new Error(`old_text بیش از یک بار پیدا شد. ۱-۲ خط قبل یا بعدش را هم اضافه کن تا یکتا شود.`);
+      }
+      const replacement = String(op.new_text ?? "");
+      current = current.slice(0, firstIdx) + replacement + current.slice(firstIdx + needle.length);
+      lastEditCenterLine = current.slice(0, firstIdx).split("\n").length;
+      continue;
+    }
+
+    if (Number.isInteger(op.start_line)) {
+      const lines = current === "" ? [] : current.split("\n");
+      const start = op.start_line;
+      const end = Number.isInteger(op.end_line) ? op.end_line : start;
+      if (start < 1 || end < start || end > lines.length) {
+        throw new Error(`بازه‌ی خط ${start}..${end} نامعتبر است (تعداد کل خطوط: ${lines.length}).`);
+      }
+      const actualFirst = lines[start - 1];
+      const expected = String(op.expected_first_line ?? "").trim();
+      if (!expected) {
+        throw new Error(`برای ویرایش خطی، پارامتر expected_first_line الزامی است تا از تغییر خط اشتباهی جلوگیری شود.`);
+      }
+      if (!actualFirst.trim().includes(expected)) {
+        const from = Math.max(0, start - 3);
+        const to = Math.min(lines.length, start + 2);
+        const context = lines
+          .slice(from, to)
+          .map((l, i) => `${from + i + 1} | ${l}`)
+          .join("\n");
+        throw new Error(
+          `خط ${start} با expected_first_line مطابقت ندارد (احتمال جابه‌جایی شماره خط). خطوط فعلی اطراف آن:\n${context}`
+        );
+      }
+      const replacementLines = op.new_text === "" ? [] : String(op.new_text ?? "").split("\n");
+      lines.splice(start - 1, end - start + 1, ...replacementLines);
+      current = lines.join("\n");
+      lastEditCenterLine = start;
+      continue;
+    }
+
+    throw new Error("هر پچ باید یا old_text/new_text داشته باشد یا start_line/expected_first_line/new_text.");
+  }
+
+  // Return updated snippet around the edited area
+  const resultLines = current === "" ? [] : current.split("\n");
+  const from = Math.max(0, lastEditCenterLine - 4);
+  const to = Math.min(resultLines.length, lastEditCenterLine + 5);
+  const preview = resultLines
+    .slice(from, to)
+    .map((l, i) => `${from + i + 1} | ${l}`)
+    .join("\n");
+
+  return { text: current, lineCount: resultLines.length, preview };
 }

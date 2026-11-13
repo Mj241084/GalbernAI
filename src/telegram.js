@@ -3,6 +3,8 @@ import { TELEGRAM_API_TIMEOUT_MS } from "./config.js";
 
 const TG_API = (token) => `https://api.telegram.org/bot${token}`;
 const CHUNK_SIZE = 3500;
+const RICH_CHUNK_SIZE = 30000; // Telegram RichMessage hard limit is 32,768 UTF-8 chars
+const MAX_RICH_MEDIA_ITEMS = 20; // Telegram server caps media at 20 in practice (docs say 50)
 
 // Splits an HTML string (already in Telegram's parse_mode="HTML" subset)
 // into chunks that each stay valid HTML on their own. A plain char-count cut
@@ -12,7 +14,7 @@ const CHUNK_SIZE = 3500;
 // silently fail to send. This walks the string tracking which tags are
 // currently open and, at each cut point, closes them to end that chunk
 // validly then reopens the same tags at the top of the next one.
-function splitIntoChunks(html, size = CHUNK_SIZE) {
+export function splitIntoChunks(html, size = CHUNK_SIZE) {
   if (html.length <= size) return [html];
   const chunks = [];
   let pos = 0;
@@ -113,8 +115,145 @@ export async function sendMessage(env, chatId, text, extra = {}) {
   return last;
 }
 
+export async function sendRichMessage(env, chatId, richMessage, extra = {}, mediaItems = null) {
+  const payloadRich = { is_rtl: true, ...richMessage };
+  let fetchOpts;
+
+  if (Array.isArray(mediaItems) && mediaItems.length > 0) {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    const mediaDescriptors = mediaItems.map((item) => ({
+      id: item.id,
+      media: { type: item.type || "photo", media: `attach://${item.id}` },
+    }));
+    form.append("rich_message", JSON.stringify({ ...payloadRich, media: mediaDescriptors }));
+    for (const [key, val] of Object.entries(extra)) {
+      if (val === undefined || val === null) continue;
+      form.append(key, typeof val === "object" ? JSON.stringify(val) : String(val));
+    }
+    for (const item of mediaItems) {
+      form.append(
+        item.id,
+        new Blob([item.bytes], { type: item.mimeType || "image/jpeg" }),
+        item.filename || `${item.id}.jpg`
+      );
+    }
+    fetchOpts = {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(Math.max(TELEGRAM_API_TIMEOUT_MS, 120000)),
+    };
+  } else {
+    fetchOpts = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, rich_message: payloadRich, ...extra }),
+      signal: AbortSignal.timeout(Math.max(TELEGRAM_API_TIMEOUT_MS, 30000)),
+    };
+  }
+
+  try {
+    const resp = await fetch(`${TG_API(env.TELEGRAM_BOT_TOKEN)}/sendRichMessage`, fetchOpts);
+    return await resp.json().catch(() => null);
+  } catch (err) {
+    console.error("sendRichMessage failed:", err.message || err);
+    return null;
+  }
+}
+
+export async function editRichMessage(env, chatId, messageId, richMessage, extra = {}) {
+  try {
+    const resp = await fetch(`${TG_API(env.TELEGRAM_BOT_TOKEN)}/editMessageText`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        rich_message: { is_rtl: true, ...richMessage },
+        ...extra,
+      }),
+      signal: AbortSignal.timeout(TELEGRAM_API_TIMEOUT_MS),
+    });
+    return await resp.json().catch(() => null);
+  } catch (err) {
+    console.error("editRichMessage failed:", err.message || err);
+    return null;
+  }
+}
+
+function shouldUseRichMarkdown(text) {
+  if (!text) return false;
+  if (text.length > CHUNK_SIZE) return true;
+  // GFM pipe tables
+  if (/^\|.+\|\s*\n\|[\s:|-]+\|/m.test(text)) return true;
+  // Collapsible details
+  if (/<details[\s>]/i.test(text)) return true;
+  // Block math $$...$$
+  if (/\$\$[\s\S]+?\$\$/m.test(text)) return true;
+  return false;
+}
+
 export async function sendMarkdown(env, chatId, markdownText, extra = {}) {
-  return sendMessage(env, chatId, markdownToTelegramHtml(markdownText), extra);
+  const src = String(markdownText || "");
+  if (shouldUseRichMarkdown(src)) {
+    const parts = [];
+    for (let i = 0; i < src.length; i += RICH_CHUNK_SIZE) {
+      parts.push(src.slice(i, i + RICH_CHUNK_SIZE));
+    }
+    let last = null;
+    let richFailed = false;
+    for (const part of parts) {
+      const res = await sendRichMessage(env, chatId, { markdown: part, is_rtl: true }, extra);
+      if (!res?.ok) {
+        richFailed = true;
+        break;
+      }
+      last = res;
+    }
+    if (!richFailed) return last;
+  }
+  return sendMessage(env, chatId, markdownToTelegramHtml(src), extra);
+}
+
+export async function sendRichMediaGallery(env, chatId, items, { mode = "slideshow", caption } = {}) {
+  const tag = mode === "collage" ? "tg-collage" : "tg-slideshow";
+  let last = null;
+  for (let offset = 0; offset < items.length; offset += MAX_RICH_MEDIA_ITEMS) {
+    const batch = items.slice(offset, offset + MAX_RICH_MEDIA_ITEMS);
+    const mediaItems = batch.map((it, idx) => ({
+      id: `p${idx}`,
+      type: "photo",
+      bytes: it.bytes,
+      mimeType: it.mimeType || "image/jpeg",
+      filename: it.filename || `photo${idx}.jpg`,
+    }));
+    const imgsHtml = mediaItems.map((m) => `<img src="tg://photo?id=${m.id}"/>`).join("");
+    const capHtml = offset === 0 && caption ? `<figcaption>${escapeHtml(caption)}</figcaption>` : "";
+    const html = `<${tag}>${imgsHtml}${capHtml}</${tag}>`;
+
+    const res = await sendRichMessage(env, chatId, { html, is_rtl: true }, {}, mediaItems);
+    if (!res?.ok) {
+      // Fallback to classic sendMediaGroup in chunks of 10 (or sendPhoto for single item)
+      for (let i = 0; i < batch.length; i += 10) {
+        const chunk = batch.slice(i, i + 10).map((it, j) => ({
+          ...it,
+          caption: offset === 0 && i === 0 && j === 0 ? caption : undefined,
+        }));
+        if (chunk.length === 1) {
+          last = await sendPhoto(env, chatId, {
+            base64: bytesToBase64(chunk[0].bytes),
+            mimeType: chunk[0].mimeType,
+            caption: chunk[0].caption,
+          });
+        } else {
+          last = await sendMediaGroup(env, chatId, chunk);
+        }
+      }
+    } else {
+      last = res;
+    }
+  }
+  return last;
 }
 
 export async function editMessage(env, chatId, messageId, text, extra = {}) {
@@ -128,6 +267,36 @@ export async function editMessage(env, chatId, messageId, text, extra = {}) {
     return await resp.json().catch(() => null);
   } catch (err) {
     console.error("editMessage failed:", err.message || err);
+    return null;
+  }
+}
+
+export async function pinMessage(env, chatId, messageId) {
+  try {
+    const resp = await fetch(`${TG_API(env.TELEGRAM_BOT_TOKEN)}/pinChatMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId, disable_notification: true }),
+      signal: AbortSignal.timeout(TELEGRAM_API_TIMEOUT_MS),
+    });
+    return await resp.json().catch(() => null);
+  } catch (err) {
+    console.error("pinMessage failed:", err.message || err);
+    return null;
+  }
+}
+
+export async function unpinMessage(env, chatId, messageId) {
+  try {
+    const resp = await fetch(`${TG_API(env.TELEGRAM_BOT_TOKEN)}/unpinChatMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+      signal: AbortSignal.timeout(TELEGRAM_API_TIMEOUT_MS),
+    });
+    return await resp.json().catch(() => null);
+  } catch (err) {
+    console.error("unpinMessage failed:", err.message || err);
     return null;
   }
 }
@@ -204,6 +373,31 @@ export async function sendPhoto(env, chatId, { base64, mimeType, caption }) {
   }
 }
 
+export async function sendMediaGroup(env, chatId, items) {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  const media = items.map((it, i) => ({
+    type: "photo",
+    media: `attach://file${i}`,
+    ...(it.caption ? { caption: it.caption.slice(0, 1000) } : {}),
+  }));
+  form.append("media", JSON.stringify(media));
+  items.forEach((it, i) => {
+    form.append(`file${i}`, new Blob([it.bytes], { type: it.mimeType || "image/jpeg" }), it.filename || `photo${i}.jpg`);
+  });
+  try {
+    const resp = await fetch(`${TG_API(env.TELEGRAM_BOT_TOKEN)}/sendMediaGroup`, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(Math.max(TELEGRAM_API_TIMEOUT_MS, 120000)),
+    });
+    return await resp.json().catch(() => null);
+  } catch (err) {
+    console.error("sendMediaGroup failed:", err.message || err);
+    return null;
+  }
+}
+
 export async function sendDocument(env, chatId, { base64, bytes, mimeType, filename, caption }) {
   const docBytes = bytes || Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
   const form = new FormData();
@@ -219,24 +413,6 @@ export async function sendDocument(env, chatId, { base64, bytes, mimeType, filen
     return await resp.json().catch(() => null);
   } catch (err) {
     console.error("sendDocument failed:", err.message || err);
-    return null;
-  }
-}
-
-// Sends a photo by remote URL directly - Telegram fetches it server-side,
-// so no download/re-upload round-trip is needed. Used by find_images:
-// Serper's own imageUrl values are passed straight through.
-export async function sendPhotoByUrl(env, chatId, { url, caption }) {
-  try {
-    const resp = await fetch(`${TG_API(env.TELEGRAM_BOT_TOKEN)}/sendPhoto`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, photo: url, caption: caption ? caption.slice(0, 1024) : undefined }),
-      signal: AbortSignal.timeout(Math.max(TELEGRAM_API_TIMEOUT_MS, 30000)),
-    });
-    return await resp.json().catch(() => null);
-  } catch (err) {
-    console.error("sendPhotoByUrl failed:", err.message || err);
     return null;
   }
 }
@@ -263,6 +439,10 @@ export async function downloadTelegramFile(env, fileId) {
     mov: "video/quicktime",
     oga: "audio/ogg",
     ogg: "audio/ogg",
+    mp3: "audio/mpeg",
+    m4a: "audio/mp4",
+    wav: "audio/wav",
+    opus: "audio/ogg",
     md: "text/markdown",
     txt: "text/plain",
   };
@@ -274,6 +454,9 @@ export function extractIncomingMedia(message) {
     const largest = message.photo[message.photo.length - 1];
     return { fileId: largest.file_id, kind: "image" };
   }
+  if (message.voice) return { fileId: message.voice.file_id, kind: "audio", mimeType: message.voice.mime_type || "audio/ogg", fileSize: message.voice.file_size, duration: message.voice.duration };
+  if (message.audio) return { fileId: message.audio.file_id, kind: "audio", mimeType: message.audio.mime_type || "audio/mpeg", filename: message.audio.file_name, fileSize: message.audio.file_size, duration: message.audio.duration };
+  if (message.video_note) return { fileId: message.video_note.file_id, kind: "video", mimeType: "video/mp4", fileSize: message.video_note.file_size, duration: message.video_note.duration };
   if (message.video) return { fileId: message.video.file_id, kind: "video", mimeType: message.video.mime_type };
   if (message.document) return { fileId: message.document.file_id, kind: "document", mimeType: message.document.mime_type, filename: message.document.file_name };
   return null;

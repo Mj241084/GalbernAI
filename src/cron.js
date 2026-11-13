@@ -1,5 +1,5 @@
-import { EMBEDDING_DIMENSIONS } from "./config.js";
-import { getDayWindow, shiftDayWindow, getIranHourMinute } from "./util.js";
+import { EMBEDDING_DIMENSIONS, IRAN_TZ } from "./config.js";
+import { getDayWindow, shiftDayWindow, getIranHourMinute, formatHumanDateTime } from "./util.js";
 import { callChatCompletions, callEmbeddings } from "./aiRouter.js";
 import { sendOwnerAlert } from "./telegram.js";
 
@@ -86,7 +86,7 @@ async function checkProactiveWakeups(env, ctx, stub) {
 // Day-3 rollover (unchanged from before - compounding summary + Vectorize)
 // ---------------------------------------------------------------------------
 
-async function checkRollover(env, ctx, stub) {
+export async function checkRollover(env, ctx, stub) {
   const today = getDayWindow();
   const lastSeenDay = await stub.getMeta(LAST_SEEN_DAY_KEY);
   if (lastSeenDay === today) return;
@@ -101,8 +101,9 @@ async function checkRollover(env, ctx, stub) {
 
   const conversationText = agedMessages
     .map((m) => {
-      if (m.role === "user") return m.content ? `کاربر: ${m.content}` : null;
-      if (m.role === "assistant") return m.content ? `دستیار: ${m.content}` : null;
+      const stamp = formatHumanDateTime(m.ts, IRAN_TZ);
+      if (m.role === "user") return m.content ? `[${stamp}] کاربر: ${m.content}` : null;
+      if (m.role === "assistant") return m.content ? `[${stamp}] دستیار: ${m.content}` : null;
       return null;
     })
     .filter(Boolean)
@@ -118,10 +119,12 @@ async function checkRollover(env, ctx, stub) {
   const coversFromDay = currentRollup ? currentRollup.covers_from_day : oldestAged;
 
   const summarizationPrompt =
-    `${previousSummaryBlock}مکالمات جدیدی که باید به خلاصه اضافه بشن:\n${conversationText}\n\n` +
-    `یک خلاصه‌ی جامع و کامل از تمام موارد بالا (خلاصه‌ی قبلی + مکالمات جدید، ترکیب‌شده) بنویس. ` +
-    `فقط جزئیات کاملاً بی‌ربط، تکراری یا کم‌اهمیت رو حذف کن - می‌خوام جامع باشه، نه کوتاه‌شده‌ی الکی. ` +
-    `فقط متن خلاصه رو بنویس، بدون مقدمه یا توضیح اضافه.`;
+    `${previousSummaryBlock}مکالمات جدیدی که باید به خلاصه اضافه بشن (با تاریخ و زمان دقیق):\n${conversationText}\n\n` +
+    `یک خلاصه‌ی جامع، ساختاریافته و دقیق از تمام موارد بالا (خلاصه‌ی قبلی + مکالمات جدید، ترکیب‌شده) بنویس:\n` +
+    `- تاریخ و ساعت دقیق رویدادها، قرارها و زمان وقوع اتفاقات را حفظ کن.\n` +
+    `- بین «تصمیم‌های قطعی و انجام‌شده‌ی کاربر» و «پیشنهادهای تاییدنشده‌ی دستیار یا ایده‌های خام» تمایز واضح بگذار.\n` +
+    `- فقط جزئیات کاملاً بی‌ربط، تکراری یا تعارف‌های کم‌اهمیت را حذف کن — خلاصه باید جامع و قابل اتکا باشد.\n` +
+    `- فقط متن خلاصه را بنویس، بدون مقدمه یا توضیح اضافه.`;
 
   let summaryText;
   try {
@@ -133,15 +136,43 @@ async function checkRollover(env, ctx, stub) {
     return;
   }
 
+  // خلاصه‌ی اختصاصی همین بازه‌ی زمانی (oldestAged..boundary) برای Vectorize تا هر وکتور یک چانک متمایز زمانی باشد
+  let windowSummaryText = summaryText;
+  if (currentRollup) {
+    const windowPrompt =
+      `این فقط مکالمات بازه‌ی ${oldestAged} تا ${boundary} است:\n${conversationText}\n\n` +
+      `یک خلاصه‌ی جامع و مستقل فقط از همین بازه‌ی زمانی بنویس (بدون اطلاعات بازه‌های قبل):\n` +
+      `- تاریخ و ساعت دقیق رویدادها و تصمیم‌ها را حفظ کن.\n` +
+      `- بین تصمیم‌های قطعی کاربر و پیشنهادهای تاییدنشده‌ی دستیار تمایز بگذار.\n` +
+      `- فقط متن خلاصه را بنویس، بدون مقدمه یا توضیح اضافه.`;
+    try {
+      const winResp = await callChatCompletions(env, { model: "auto", messages: [{ role: "user", content: windowPrompt }] });
+      const winText = winResp.choices?.[0]?.message?.content?.trim();
+      if (winText) windowSummaryText = winText;
+    } catch (err) {
+      await sendOwnerAlert(env, `⚠️ <b>هشدار در ساخت خلاصه‌ی پنجره‌ای برای Vectorize</b>\n<code>${String(err.message || err).slice(0, 400)}</code>`);
+    }
+  }
+
   const vectorId = crypto.randomUUID();
-  const rollupRecord = await stub.setCurrentRollup({ coversFromDay, coversToDay: boundary, summary: summaryText, vectorId });
+  const rollupRecord = await stub.setCurrentRollup({
+    coversFromDay,
+    coversToDay: boundary,
+    summary: summaryText,
+    windowSummary: windowSummaryText,
+    vectorId,
+  });
   const rollupId = rollupRecord?.id || null;
 
   try {
-    const [vector] = await callEmbeddings(env, summaryText, EMBEDDING_DIMENSIONS);
+    const [vector] = await callEmbeddings(env, windowSummaryText, EMBEDDING_DIMENSIONS);
     if (env.MEMORY_INDEX) {
       await env.MEMORY_INDEX.upsert([
-        { id: vectorId, values: vector, metadata: { rollup_id: rollupId, covers_from_day: coversFromDay, covers_to_day: boundary } },
+        {
+          id: vectorId,
+          values: vector,
+          metadata: { rollup_id: rollupId, covers_from_day: oldestAged, covers_to_day: boundary },
+        },
       ]);
     }
   } catch (err) {

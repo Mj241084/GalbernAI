@@ -1,5 +1,16 @@
-import { DurableObject } from "cloudflare:workers";
-import { getDayWindow, shiftDayWindow } from "./util.js";
+let DurableObjectBase;
+try {
+  const workers = await import("cloudflare:workers");
+  DurableObjectBase = workers.DurableObject;
+} catch {
+  DurableObjectBase = class {
+    constructor(ctx, env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  };
+}
+import { applySafePatches, getDayWindow, shiftDayWindow } from "./util.js";
 import { MAX_LOG_ROWS } from "./config.js";
 
 const MEDIA_GROUP_DEBOUNCE_MS = 1500;
@@ -40,7 +51,8 @@ CREATE TABLE IF NOT EXISTS plans (
   goal TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active',
   created_at INTEGER NOT NULL,
-  completed_at INTEGER
+  completed_at INTEGER,
+  telegram_message_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS plan_items (
@@ -67,6 +79,7 @@ CREATE TABLE IF NOT EXISTS rollups (
   covers_from_day TEXT NOT NULL,
   covers_to_day TEXT NOT NULL,
   summary TEXT NOT NULL,
+  window_summary TEXT,
   vector_id TEXT,
   is_current INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
@@ -110,6 +123,7 @@ CREATE TABLE IF NOT EXISTS notes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
   body TEXT NOT NULL,
+  tags TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -140,7 +154,13 @@ function rowsOf(cursor) {
   return cursor.toArray();
 }
 
-export class AgentDO extends DurableObject {
+const MIGRATIONS = [
+  `ALTER TABLE plans ADD COLUMN telegram_message_id INTEGER`,
+  `ALTER TABLE notes ADD COLUMN tags TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE rollups ADD COLUMN window_summary TEXT`,
+];
+
+export class AgentDO extends DurableObjectBase {
   constructor(ctx, env) {
     super(ctx, env);
     this.ctx = ctx;
@@ -150,6 +170,9 @@ export class AgentDO extends DurableObject {
       for (const stmt of SCHEMA.split(";")) {
         const trimmed = stmt.trim();
         if (trimmed) this.ctx.storage.sql.exec(trimmed);
+      }
+      for (const stmt of MIGRATIONS) {
+        try { this.ctx.storage.sql.exec(stmt); } catch { /* روی نصب تازه ستون از قبل هست */ }
       }
       try {
         this.ctx.storage.sql.exec(
@@ -310,6 +333,17 @@ export class AgentDO extends DurableObject {
     return { ok: true };
   }
 
+  patchMemoryProfile(edits) {
+    const current = this.getMemoryProfile();
+    const patched = applySafePatches(current, edits);
+    this.setMemoryProfile(patched.text);
+    return {
+      ok: true,
+      line_count: patched.lineCount,
+      preview: patched.preview,
+    };
+  }
+
   // -------------------------------------------------------------------
   // Todos
   // -------------------------------------------------------------------
@@ -375,7 +409,21 @@ export class AgentDO extends DurableObject {
   // Plan
   // -------------------------------------------------------------------
 
-  getActivePlan() {
+  getPlanById(planId) {
+  const plan = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM plans WHERE id = ?`, planId))[0];
+  if (!plan) return null;
+  const items = rowsOf(
+    this.ctx.storage.sql.exec(`SELECT * FROM plan_items WHERE plan_id = ? ORDER BY position ASC`, planId)
+  );
+  return { plan, items };
+}
+
+setPlanMessageId(planId, messageId) {
+  this.ctx.storage.sql.exec(`UPDATE plans SET telegram_message_id = ? WHERE id = ?`, messageId, planId);
+  return { ok: true };
+}
+
+getActivePlan() {
     const plan = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM plans WHERE status = 'active' ORDER BY id DESC LIMIT 1`))[0];
     if (!plan) return null;
     const items = rowsOf(
@@ -421,13 +469,13 @@ export class AgentDO extends DurableObject {
       this.ctx.storage.sql.exec(`UPDATE plans SET status='completed', completed_at=? WHERE id=?`, Date.now(), item.plan_id);
       planCompleted = true;
     }
-    return { itemId, planCompleted };
+    return { itemId, planId: item.plan_id, planCompleted };
   }
 
   renderPlanBlock() {
     const active = this.getActivePlan();
     if (!active) return "";
-    const lines = active.items.map((it) => `${it.done ? "✅" : "◻️"} ${it.description}`);
+    const lines = active.items.map((it) => `${it.done ? "✅" : "◻️"} [item_id=${it.id}] ${it.description}`);
     return `برنامه‌ی فعال فعلی («${active.plan.goal}»):\n${lines.join("\n")}`;
   }
 
@@ -466,6 +514,21 @@ export class AgentDO extends DurableObject {
     return { deleted: true };
   }
 
+  deleteSkillById(id) {
+    this.ctx.storage.sql.exec(`DELETE FROM skills WHERE id = ?`, id);
+    return { deleted: true };
+  }
+
+  toggleSkill(nameOrId, enabled = null) {
+    const row = typeof nameOrId === "number" || /^\d+$/.test(String(nameOrId))
+      ? rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM skills WHERE id = ?`, Number(nameOrId)))[0]
+      : rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM skills WHERE name = ?`, String(nameOrId)))[0];
+    if (!row) throw new Error(`skill "${nameOrId}" not found`);
+    const next = enabled === null || enabled === undefined ? (row.enabled ? 0 : 1) : (enabled ? 1 : 0);
+    this.ctx.storage.sql.exec(`UPDATE skills SET enabled = ? WHERE id = ?`, next, row.id);
+    return rowsOf(this.ctx.storage.sql.exec(`SELECT id, name, description, enabled FROM skills WHERE id = ?`, row.id))[0];
+  }
+
   // -------------------------------------------------------------------
   // Rollups
   // -------------------------------------------------------------------
@@ -478,13 +541,14 @@ export class AgentDO extends DurableObject {
     return rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM rollups ORDER BY id DESC`));
   }
 
-  setCurrentRollup({ coversFromDay, coversToDay, summary, vectorId }) {
+  setCurrentRollup({ coversFromDay, coversToDay, summary, windowSummary = null, vectorId }) {
     this.ctx.storage.sql.exec(`UPDATE rollups SET is_current = 0 WHERE is_current = 1`);
     this.ctx.storage.sql.exec(
-      `INSERT INTO rollups (covers_from_day, covers_to_day, summary, vector_id, is_current, created_at) VALUES (?,?,?,?,1,?)`,
+      `INSERT INTO rollups (covers_from_day, covers_to_day, summary, window_summary, vector_id, is_current, created_at) VALUES (?,?,?,?,?,1,?)`,
       coversFromDay,
       coversToDay,
       summary,
+      windowSummary,
       vectorId || null,
       Date.now()
     );
@@ -607,6 +671,14 @@ export class AgentDO extends DurableObject {
     return { deleted: true };
   }
 
+  toggleWakeSlot(id, enabled = null) {
+    const row = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM wake_schedule WHERE id = ?`, id))[0];
+    if (!row) throw new Error(`wake slot ${id} not found`);
+    const next = enabled === null || enabled === undefined ? (row.enabled ? 0 : 1) : (enabled ? 1 : 0);
+    this.ctx.storage.sql.exec(`UPDATE wake_schedule SET enabled = ? WHERE id = ?`, next, id);
+    return rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM wake_schedule WHERE id = ?`, id))[0];
+  }
+
   getDueWakeSlots(nowMinutes, today, graceMinutes = 60) {
     const slots = rowsOf(
       this.ctx.storage.sql.exec(
@@ -630,33 +702,88 @@ export class AgentDO extends DurableObject {
   // Notes
   // -------------------------------------------------------------------
 
-  createNote({ title, body }) {
+  listNotesIndex({ limit = 20 } = {}) {
+    const lim = Math.max(1, Math.min(60, limit | 0));
+    return rowsOf(this.ctx.storage.sql.exec(
+      `SELECT id, title, tags, updated_at FROM notes ORDER BY updated_at DESC LIMIT ?`, lim
+    ));
+  }
+
+  appendToNote(id, { text, heading = null }) {
+    const existing = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM notes WHERE id = ?`, id))[0];
+    if (!existing) throw new Error(`note ${id} not found`);
+    if ((existing.body || "").length > 100_000) {
+      throw new Error(`حجم این یادداشت از ۱۰۰ هزار کاراکتر گذشته است. لطفاً یک یادداشت جدید بسازید.`);
+    }
+    const stamp = new Date().toLocaleString("fa-IR", { timeZone: "Asia/Tehran" });
+    const block = `\n\n---\n**${heading || stamp}**\n${text}`;
+    const body = existing.body + block;
+    this.ctx.storage.sql.exec(`UPDATE notes SET body = ?, updated_at = ? WHERE id = ?`, body, Date.now(), id);
+    return rowsOf(this.ctx.storage.sql.exec(`SELECT id, title, tags, updated_at, LENGTH(body) as body_length FROM notes WHERE id = ?`, id))[0];
+  }
+
+  createNote({ title, body, tags = "" }) {
     if (!title || !body) throw new Error("title and body are required");
     const now = Date.now();
     this.ctx.storage.sql.exec(
-      `INSERT INTO notes (title, body, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+      `INSERT INTO notes (title, body, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
       title,
       body,
+      String(tags || ""),
       now,
       now
     );
     return rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM notes WHERE id = last_insert_rowid()`))[0];
   }
 
-  updateNote(id, { title, body }) {
+  updateNote(id, { title, body, tags }) {
     const existing = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM notes WHERE id = ?`, id))[0];
     if (!existing) throw new Error(`note ${id} not found`);
     const newTitle = title !== undefined ? title : existing.title;
     const newBody = body !== undefined ? body : existing.body;
+    const newTags = tags !== undefined ? String(tags) : existing.tags;
     const now = Date.now();
     this.ctx.storage.sql.exec(
-      `UPDATE notes SET title = ?, body = ?, updated_at = ? WHERE id = ?`,
+      `UPDATE notes SET title = ?, body = ?, tags = ?, updated_at = ? WHERE id = ?`,
       newTitle,
       newBody,
+      newTags,
       now,
       id
     );
     return rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM notes WHERE id = ?`, id))[0];
+  }
+
+  patchNote(id, { edits, expectedUpdatedAt = null, title = undefined, tags = undefined } = {}) {
+    const existing = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM notes WHERE id = ?`, id))[0];
+    if (!existing) throw new Error(`note ${id} not found`);
+    if (expectedUpdatedAt !== null && expectedUpdatedAt !== undefined && existing.updated_at !== expectedUpdatedAt) {
+      throw new Error(
+        `یادداشت ${id} از آخرین باری که خواندی تغییر کرده (expected updated_at=${expectedUpdatedAt}, actual=${existing.updated_at}). اول دوباره get_note بزن.`
+      );
+    }
+    const patched = applySafePatches(existing.body, edits);
+    const newTitle = title !== undefined ? title : existing.title;
+    const newTags = tags !== undefined ? String(tags) : existing.tags;
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `UPDATE notes SET title = ?, body = ?, tags = ?, updated_at = ? WHERE id = ?`,
+      newTitle,
+      patched.text,
+      newTags,
+      now,
+      id
+    );
+    const updated = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM notes WHERE id = ?`, id))[0];
+    return {
+      id: updated.id,
+      title: updated.title,
+      tags: updated.tags,
+      created_at: updated.created_at,
+      updated_at: updated.updated_at,
+      line_count: patched.lineCount,
+      preview: patched.preview,
+    };
   }
 
   deleteNote(id) {
@@ -670,7 +797,7 @@ export class AgentDO extends DurableObject {
     return row;
   }
 
-  searchNotes({ query, dateFrom, dateTo, dateField = "created", limit = 10 } = {}) {
+  searchNotes({ query, tags, dateFrom, dateTo, dateField = "created", limit = 10 } = {}) {
     const lim = Math.max(1, Math.min(100, limit | 0));
     const conditions = [];
     const params = [];
@@ -685,13 +812,18 @@ export class AgentDO extends DurableObject {
       params.push(dateTo);
     }
 
+    if (tags && typeof tags === "string" && tags.trim()) {
+      conditions.push(`tags LIKE ?`);
+      params.push(`%${tags.trim()}%`);
+    }
+
     if (query && typeof query === "string" && query.trim()) {
       const q = query.trim();
       if (this._notesFtsAvailable) {
         try {
           const ftsRows = rowsOf(
             this.ctx.storage.sql.exec(
-              `SELECT rowid FROM notes_fts WHERE notes_fts MATCH ?`,
+              `SELECT rowid FROM notes_fts WHERE notes_fts MATCH ? LIMIT 200`,
               q
             )
           );
@@ -778,27 +910,34 @@ export class AgentDO extends DurableObject {
 
   async alarm() {
     const now = Date.now();
+    let retryAt = null;
     const groups = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM pending_media_groups`));
-    let nextAlarmAt = null;
-
     for (const g of groups) {
-      if (now - g.last_seen_at >= MEDIA_GROUP_DEBOUNCE_MS) {
-        this.ctx.storage.sql.exec(`DELETE FROM pending_media_groups WHERE media_group_id = ?`, g.media_group_id);
-        
+      if (now - g.last_seen_at < MEDIA_GROUP_DEBOUNCE_MS) continue;
+      try {
         if (this.env && this.env.TURNS_QUEUE) {
           await this.env.TURNS_QUEUE.send({
             chatId: g.chat_id,
             trigger: { kind: "user_message", text: g.caption || "", mediaRefs: JSON.parse(g.items) },
+            dedupeKey: `album:${g.media_group_id}`,
           });
         }
-      } else {
-        const readyAt = g.last_seen_at + MEDIA_GROUP_DEBOUNCE_MS;
-        nextAlarmAt = nextAlarmAt ? Math.min(nextAlarmAt, readyAt) : readyAt;
+        this.ctx.storage.sql.exec(`DELETE FROM pending_media_groups WHERE media_group_id = ?`, g.media_group_id);
+      } catch (err) {
+        console.error(`album flush failed for group ${g.media_group_id}:`, err);
+        retryAt = Math.min(retryAt ?? Infinity, now + 30_000);
       }
     }
 
-    if (nextAlarmAt) {
-      await this.ctx.storage.setAlarm(nextAlarmAt);
+    const remaining = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM pending_media_groups`));
+    let nextAlarmAt = retryAt;
+    for (const g of remaining) {
+      const readyAt = g.last_seen_at + MEDIA_GROUP_DEBOUNCE_MS;
+      nextAlarmAt = Math.min(nextAlarmAt ?? Infinity, readyAt);
+    }
+
+    if (nextAlarmAt && Number.isFinite(nextAlarmAt)) {
+      await this.ctx.storage.setAlarm(Math.max(nextAlarmAt, now + 1000));
     }
   }
 
@@ -814,6 +953,10 @@ export class AgentDO extends DurableObject {
 
   getSandboxByCode(code) {
     return rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM sandboxes WHERE code = ?`, code))[0] || null;
+  }
+
+  getSandboxById(id) {
+    return rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM sandboxes WHERE id = ?`, id))[0] || null;
   }
 
   getMainSandbox() {

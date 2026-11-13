@@ -1,7 +1,20 @@
 import { AgentDO } from "./agentDO.js";
 import { handleScheduled } from "./cron.js";
 import { runAgentTurnLocked } from "./agentLoop.js";
-import { extractIncomingMedia, sendMessage, sendMarkdown, sendOwnerAlert, downloadTelegramFile, editMessage, answerCallbackQuery } from "./telegram.js";
+import {
+  extractIncomingMedia,
+  sendMessage,
+  sendMarkdown,
+  sendRichMessage,
+  editRichMessage,
+  sendOwnerAlert,
+  downloadTelegramFile,
+  editMessage,
+  answerCallbackQuery,
+} from "./telegram.js";
+import { publishPlanMessage } from "./tools/plan.js";
+import { IMGSEARCH_PY } from "./sandboxAssets/imgsearch.js";
+import { BUILTIN_SKILLS } from "./builtinSkills.js";
 import { NOTES_PAGE_SIZE } from "./config.js";
 import { escapeHtml, safeJsonParse, base64ToUtf8Text } from "./util.js";
 
@@ -22,6 +35,7 @@ function getStub(env) {
     {},
     {
       get(_, prop) {
+        if (typeof prop !== "string" || prop === "then") return undefined;
         return async (...args) => {
           for (let attempt = 0; attempt < 3; attempt++) {
             try {
@@ -52,11 +66,13 @@ const HELP_TEXT = `🤖 <b>دستیار شخصی</b>
 /delwakeup &lt;id&gt; — حذف یک زمان بیدارباش
 /unlock — آزادسازی فوری قفل نوبت ایجنت
 /sandboxes — لیست همه سندباکس‌های ثبت‌شده
-/addsandbox <code> <vm_id> [توضیح...] — ثبت یک سندباکس جدید
-/setmainsandbox <code> — تعیین سندباکس پیش‌فرض/اصلی
-/delsandbox <code> — حذف یک سندباکس
-/enablesandbox <code> — فعال‌سازی مجدد یک سندباکس
-/disablesandbox <code> — غیرفعال‌سازی موقت یک سندباکس
+/addsandbox &lt;code&gt; &lt;vm_id&gt; [توضیح...] — ثبت یک سندباکس جدید
+/setmainsandbox &lt;code&gt; — تعیین سندباکس پیش‌فرض/اصلی
+/delsandbox &lt;code&gt; — حذف یک سندباکس
+/enablesandbox &lt;code&gt; — فعال‌سازی مجدد یک سندباکس
+/disablesandbox &lt;code&gt; — غیرفعال‌سازی موقت یک سندباکس
+/provisionsandbox [code] — تنظیم اسکریپت‌ها و کلیدهای مورد نیاز در سندباکس
+/seedskills — نصب/به‌روزرسانی skillهای داخلی سیستم
 /model — انتخاب مدل فعال چت از روتر به صورت زنده
 /notes [صفحه] — لیست پیج‌بندی‌شده‌ی یادداشت‌ها
 /memory — نمایش پروفایل حافظه‌ی فعلی
@@ -184,7 +200,14 @@ async function handleWebhook(request, env, ctx) {
         .bufferMediaGroupItem({
           mediaGroupId: String(mediaGroupId),
           chatId,
-          item: { fileId: media.fileId, kind: media.kind, mimeType: media.mimeType },
+          item: {
+            fileId: media.fileId,
+            kind: media.kind,
+            mimeType: media.mimeType,
+            filename: media.filename,
+            fileSize: media.fileSize,
+            duration: media.duration,
+          },
           caption: message.caption || null,
         })
         .catch((err) =>
@@ -228,7 +251,16 @@ async function handleWebhook(request, env, ctx) {
     return new Response("ok");
   }
 
-  const mediaRefs = media ? [{ fileId: media.fileId, kind: media.kind, mimeType: media.mimeType }] : [];
+  const mediaRefs = media
+    ? [{
+        fileId: media.fileId,
+        kind: media.kind,
+        mimeType: media.mimeType,
+        filename: media.filename,
+        fileSize: media.fileSize,
+        duration: media.duration,
+      }]
+    : [];
   const messageId = message.message_id;
   await env.TURNS_QUEUE.send({
     chatId,
@@ -341,13 +373,8 @@ async function handleCommand(text, env, ctx, stub, chatId) {
         break;
 
       case "/skills": {
-        const skills = await stub.listSkills({ enabledOnly: false });
-        if (!skills.length) {
-          await sendMessage(env, chatId, "هیچ skillای ثبت نشده.");
-        } else {
-          const body = skills.map((s) => `${s.enabled ? "✅" : "⛔"} <b>${escapeHtml(s.name)}</b>\n${escapeHtml(s.description)}`).join("\n\n");
-          await sendMessage(env, chatId, body);
-        }
+        const view = await renderSkillsView(stub);
+        await sendRichOrFallback(env, chatId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
         break;
       }
 
@@ -378,15 +405,8 @@ async function handleCommand(text, env, ctx, stub, chatId) {
       }
 
       case "/wakeups": {
-        const slots = await stub.listWakeSchedule();
-        if (!slots.length) {
-          await sendMessage(env, chatId, "هیچ زمان بیدارباشی ثبت نشده.");
-        } else {
-          const body = slots
-            .map((s) => `${s.enabled ? "⏰" : "⛔"} <b>[${s.id}] ${escapeHtml(s.time_hhmm)}</b> — ${escapeHtml(s.theme)}`)
-            .join("\n");
-          await sendMessage(env, chatId, body);
-        }
+        const view = await renderWakeupsView(stub);
+        await sendRichOrFallback(env, chatId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
         break;
       }
 
@@ -414,13 +434,8 @@ async function handleCommand(text, env, ctx, stub, chatId) {
       }
 
       case "/sandboxes": {
-        const list = await stub.listSandboxes({ enabledOnly: false });
-        if (!list.length) {
-          await sendMessage(env, chatId, "هیچ سندباکسی ثبت نشده است.");
-        } else {
-          const body = list.map((s) => `${s.enabled ? "✅" : "⛔"} ${s.is_main ? "⭐ " : ""}<b>${escapeHtml(s.code)}</b> (vm: <code>${escapeHtml(s.vm_id)}</code>)\n${escapeHtml(s.description || "بدون توضیح")}`).join("\n\n");
-          await sendMessage(env, chatId, body);
-        }
+        const view = await renderSandboxesView(stub);
+        await sendRichOrFallback(env, chatId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
         break;
       }
 
@@ -486,6 +501,65 @@ async function handleCommand(text, env, ctx, stub, chatId) {
         break;
       }
 
+      case "/provisionsandbox": {
+        const targetCode = restOfFirstLine.trim();
+        let targetSandbox;
+        if (targetCode) {
+          targetSandbox = await stub.getSandboxByCode(targetCode);
+        } else {
+          targetSandbox = await stub.getMainSandbox();
+        }
+        if (!targetSandbox) {
+          await sendMessage(env, chatId, `❌ سندباکسی پیدا نشد.`);
+          break;
+        }
+
+        const vmId = targetSandbox.vm_id;
+        const q = (v) => `'${String(v || "").replace(/'/g, `'\\''`)}'`;
+        const envSh =
+          `export SERPER_API_KEY=${q(env.SERPER_API_KEY)}\n` +
+          `export AI_ROUTER_BASE_URL=${q(env.AI_ROUTER_BASE_URL)}\n` +
+          `export AI_ROUTER_PROXY_TOKEN=${q(env.AI_ROUTER_PROXY_TOKEN)}\n`;
+
+        await sendMessage(env, chatId, `⏳ در حال آماده‌سازی سندباکس <b>${escapeHtml(targetSandbox.code)}</b>...`);
+
+        try {
+          const { freestyleWriteFile, freestyleExec } = await import("./freestyleClient.js");
+          const encoder = new TextEncoder();
+          await freestyleExec(env, vmId, "mkdir -p /home/ubuntu/.galbern /home/ubuntu/tools /home/ubuntu/uploads");
+          await freestyleWriteFile(env, vmId, "/home/ubuntu/.galbern/env.sh", encoder.encode(envSh));
+          await freestyleExec(env, vmId, "chmod 600 /home/ubuntu/.galbern/env.sh");
+          await freestyleWriteFile(env, vmId, "/home/ubuntu/tools/imgsearch.py", encoder.encode(IMGSEARCH_PY));
+          await freestyleExec(env, vmId, "chmod +x /home/ubuntu/tools/imgsearch.py");
+
+          const smoke = await freestyleExec(
+            env,
+            vmId,
+            `python3 -c 'import urllib.request,json,base64,concurrent.futures; print("ok")'`
+          );
+          const helpCheck = await freestyleExec(env, vmId, "python3 /home/ubuntu/tools/imgsearch.py --help");
+
+          if (smoke.stdout.includes("ok") && helpCheck.stdout.includes("imgsearch.py")) {
+            await sendMessage(env, chatId, `✅ آماده‌سازی سندباکس <b>${escapeHtml(targetSandbox.code)}</b> با موفقیت انجام شد.\n۳ متغیر محیطی نوشته شد و اسکریپت imgsearch.py نصب گردید.`);
+          } else {
+            await sendMessage(env, chatId, `⚠️ آماده‌سازی انجام شد ولی تست اسکریپت با خطا مواجه گردید:\n<code>${escapeHtml(smoke.stderr || helpCheck.stderr)}</code>`);
+          }
+        } catch (err) {
+          await sendMessage(env, chatId, `❌ خطا در آماده‌سازی سندباکس:\n<code>${escapeHtml(err.message || String(err))}</code>`);
+        }
+        break;
+      }
+
+      case "/seedskills": {
+        let added = 0;
+        for (const skill of BUILTIN_SKILLS) {
+          await stub.addSkill(skill);
+          added++;
+        }
+        await sendMessage(env, chatId, `✅ تعداد ${added} skill داخلی با موفقیت در سیستم نصب/به‌روزرسانی شد.`);
+        break;
+      }
+
       case "/notes": {
         const page = parseInt(args[0], 10) || 1;
         await renderNotesPageMessage(env, stub, chatId, page);
@@ -504,24 +578,23 @@ async function handleCommand(text, env, ctx, stub, chatId) {
       }
 
       case "/todos": {
-        const todos = await stub.listTodos({ status: "pending" });
-        if (!todos.length) {
-          await sendMessage(env, chatId, "یادآوری در انتظاری نیست.");
-        } else {
-          const body = todos
-            .map(
-              (t) =>
-                `🗒 <b>${escapeHtml(t.title)}</b> — ${new Date(t.due_at).toLocaleString("fa-IR", { timeZone: "Asia/Tehran" })}\n${escapeHtml(t.description || "")}`
-            )
-            .join("\n\n");
-          await sendMessage(env, chatId, body);
-        }
+        const view = await renderTodosView(stub);
+        await sendRichOrFallback(env, chatId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
         break;
       }
 
       case "/plan": {
-        const block = await stub.renderPlanBlock();
-        await sendMessage(env, chatId, block || "الان هیچ برنامه‌ی فعالی نیست.");
+        const active = await stub.getActivePlan();
+        if (!active) {
+          await sendMessage(env, chatId, "الان هیچ برنامه‌ی فعالی نیست.");
+        } else {
+          const msgId = await publishPlanMessage(env, stub, chatId, active.plan.id);
+          if (msgId) {
+            await sendMessage(env, chatId, "📌 برنامه‌ی فعال بالای چت پین شده است.");
+          } else {
+            await sendMessage(env, chatId, "⚠️ خطا در انتشار یا پین کردن برنامه‌ی فعال.");
+          }
+        }
         break;
       }
 
@@ -579,18 +652,74 @@ async function formatAgentStats(stub, args) {
   return out.trim();
 }
 
+async function sendRichOrFallback(env, chatId, richMsg, fallbackHtml, fallbackExtra = {}) {
+  const res = await sendRichMessage(env, chatId, richMsg);
+  if (res?.ok) return res;
+  return sendMessage(env, chatId, fallbackHtml, fallbackExtra);
+}
+
+async function editRichOrFallback(env, chatId, messageId, richMsg, fallbackHtml, fallbackExtra = {}) {
+  const res = await editRichMessage(env, chatId, messageId, richMsg);
+  if (res?.ok || /message is not modified/i.test(res?.description || "")) return res;
+  return editMessage(env, chatId, messageId, fallbackHtml, fallbackExtra);
+}
+
+export async function renderNotesPageRich(stub, page = 1) {
+  let data = await stub.listNotesPaginated({ page, pageSize: NOTES_PAGE_SIZE });
+  if (data.totalCount > 0 && data.notes.length === 0 && page > data.totalPages) {
+    data = await stub.listNotesPaginated({ page: data.totalPages, pageSize: NOTES_PAGE_SIZE });
+  }
+  const { notes, totalCount, totalPages, page: currentPage } = data;
+  if (!notes.length) {
+    return { html: "<p>هیچ یادداشتی ثبت نشده.</p>", is_rtl: true };
+  }
+  const blocks = [
+    `<h3>📝 لیست یادداشت‌ها</h3>`,
+    `<p>صفحه ${currentPage} از ${totalPages} — کل: ${totalCount}</p>`,
+  ];
+  for (const n of notes) {
+    const tagsHtml = n.tags ? ` <code>${escapeHtml(n.tags)}</code>` : "";
+    const dateStr = new Date(n.updated_at).toLocaleDateString("fa-IR", { timeZone: "Asia/Tehran" });
+    blocks.push(
+      `<p><b>[${n.id}] ${escapeHtml(n.title)}</b>${tagsHtml}<br><i>به‌روزرسانی: ${escapeHtml(dateStr)}</i></p>` +
+      `<tg-button-row align="left">` +
+      `<tg-button type="callback_data" style="primary" data="note:view:${n.id}:${currentPage}">📖 مشاهده</tg-button>` +
+      `<tg-button type="callback_data" style="danger" data="note:del:${n.id}:${currentPage}">🗑 حذف</tg-button>` +
+      `</tg-button-row>`
+    );
+  }
+  const navButtons = [];
+  if (currentPage > 1) {
+    navButtons.push(`<tg-button type="callback_data" data="note:page:${currentPage - 1}">⬅️ قبلی</tg-button>`);
+  }
+  navButtons.push(`<tg-button type="disabled">صفحه ${currentPage}/${totalPages}</tg-button>`);
+  if (currentPage < totalPages) {
+    navButtons.push(`<tg-button type="callback_data" data="note:page:${currentPage + 1}">بعدی ➡️</tg-button>`);
+  }
+  blocks.push(`<hr/><tg-button-row align="center">${navButtons.join("")}</tg-button-row>`);
+  return { html: blocks.join("\n"), is_rtl: true };
+}
+
 async function renderNotesPageData(stub, page = 1) {
-  const { notes, totalCount, totalPages, page: currentPage } = await stub.listNotesPaginated({ page, pageSize: NOTES_PAGE_SIZE });
+  let data = await stub.listNotesPaginated({ page, pageSize: NOTES_PAGE_SIZE });
+  if (data.totalCount > 0 && data.notes.length === 0 && page > data.totalPages) {
+    data = await stub.listNotesPaginated({ page: data.totalPages, pageSize: NOTES_PAGE_SIZE });
+  }
+  const { notes, totalCount, totalPages, page: currentPage } = data;
   if (!notes.length) {
     return { text: "هیچ یادداشتی ثبت نشده.", reply_markup: undefined };
   }
 
-  let text = `📝 <b>لیست یادداشت‌ها</b> (صفحه ${currentPage} از ${totalPages} — کل: ${totalCount})\nبرای مشاهده روی عنوان کلیک کن:\n`;
+  const text = `📝 <b>لیست یادداشت‌ها</b> (صفحه ${currentPage} از ${totalPages} — کل: ${totalCount})\nبرای مشاهده روی عنوان کلیک کن:\n`;
 
   const inlineKeyboard = notes.map((n) => [
     {
-      text: n.title.length > 32 ? `${n.title.slice(0, 32)}...` : n.title,
+      text: n.title.length > 28 ? `${n.title.slice(0, 28)}...` : n.title,
       callback_data: `note:view:${n.id}:${currentPage}`,
+    },
+    {
+      text: "🗑 حذف",
+      callback_data: `note:del:${n.id}:${currentPage}`,
     },
   ]);
 
@@ -608,8 +737,153 @@ async function renderNotesPageData(stub, page = 1) {
 }
 
 async function renderNotesPageMessage(env, stub, chatId, page = 1) {
-  const { text, reply_markup } = await renderNotesPageData(stub, page);
-  await sendMessage(env, chatId, text, reply_markup ? { reply_markup } : {});
+  const [richMsg, fallback] = await Promise.all([renderNotesPageRich(stub, page), renderNotesPageData(stub, page)]);
+  await sendRichOrFallback(env, chatId, richMsg, fallback.text, fallback.reply_markup ? { reply_markup: fallback.reply_markup } : {});
+}
+
+async function renderTodosView(stub) {
+  const todos = await stub.listTodos({ status: "pending" });
+  if (!todos.length) {
+    return {
+      richMsg: { html: "<p>یادآوری در انتظاری نیست.</p>", is_rtl: true },
+      fallbackHtml: "یادآوری در انتظاری نیست.",
+      fallbackExtra: {},
+    };
+  }
+  const blocks = ["<h3>🗒 یادآوری‌های در انتظار</h3>"];
+  const fallbackLines = [];
+  const inlineKeyboard = [];
+  for (const t of todos) {
+    const dueStr = new Date(t.due_at).toLocaleString("fa-IR", { timeZone: "Asia/Tehran" });
+    blocks.push(
+      `<p><b>[${t.id}] ${escapeHtml(t.title)}</b><br><i>زمان: ${escapeHtml(dueStr)}</i>${t.description ? `<br>${escapeHtml(t.description)}` : ""}</p>` +
+      `<tg-button-row align="left">` +
+      `<tg-button type="callback_data" style="success" data="todo:done:${t.id}">✅ انجام شد</tg-button>` +
+      `<tg-button type="callback_data" style="danger" data="todo:del:${t.id}">🗑 حذف</tg-button>` +
+      `</tg-button-row>`
+    );
+    fallbackLines.push(`🗒 <b>[${t.id}] ${escapeHtml(t.title)}</b> — ${escapeHtml(dueStr)}${t.description ? `\n${escapeHtml(t.description)}` : ""}`);
+    inlineKeyboard.push([
+      { text: `✅ [${t.id}] انجام شد`, callback_data: `todo:done:${t.id}` },
+      { text: "🗑 حذف", callback_data: `todo:del:${t.id}` },
+    ]);
+  }
+  return {
+    richMsg: { html: blocks.join("\n"), is_rtl: true },
+    fallbackHtml: fallbackLines.join("\n\n"),
+    fallbackExtra: { reply_markup: { inline_keyboard: inlineKeyboard } },
+  };
+}
+
+async function renderSandboxesView(stub) {
+  const list = await stub.listSandboxes({ enabledOnly: false });
+  if (!list.length) {
+    return {
+      richMsg: { html: "<p>هیچ سندباکسی ثبت نشده است.</p>", is_rtl: true },
+      fallbackHtml: "هیچ سندباکسی ثبت نشده است.",
+      fallbackExtra: {},
+    };
+  }
+  const blocks = ["<h3>💻 سندباکس‌های ثبت‌شده</h3>"];
+  const fallbackLines = [];
+  const inlineKeyboard = [];
+  for (const s of list) {
+    blocks.push(
+      `<p>${s.enabled ? "✅" : "⛔"} ${s.is_main ? "⭐ " : ""}<b>${escapeHtml(s.code)}</b> (<code>${escapeHtml(s.vm_id)}</code>)<br>${escapeHtml(s.description || "بدون توضیح")}</p>` +
+      `<tg-button-row align="left">` +
+      (s.is_main
+        ? `<tg-button type="disabled">⭐ اصلی</tg-button>`
+        : `<tg-button type="callback_data" style="primary" data="sb:main:${s.id}">⭐ اصلی</tg-button>`) +
+      (s.enabled
+        ? `<tg-button type="callback_data" data="sb:toggle:${s.id}:0">⛔ غیرفعال</tg-button>`
+        : `<tg-button type="callback_data" style="success" data="sb:toggle:${s.id}:1">✅ فعال</tg-button>`) +
+      `<tg-button type="callback_data" style="danger" data="sb:del:${s.id}">🗑 حذف</tg-button>` +
+      `</tg-button-row>`
+    );
+    fallbackLines.push(
+      `${s.enabled ? "✅" : "⛔"} ${s.is_main ? "⭐ " : ""}<b>${escapeHtml(s.code)}</b> (vm: <code>${escapeHtml(s.vm_id)}</code>)\n${escapeHtml(s.description || "بدون توضیح")}`
+    );
+    const row = [];
+    if (!s.is_main) row.push({ text: `⭐ ${s.code} اصلی`, callback_data: `sb:main:${s.id}` });
+    row.push({ text: s.enabled ? `⛔ ${s.code}` : `✅ ${s.code}`, callback_data: `sb:toggle:${s.id}:${s.enabled ? 0 : 1}` });
+    row.push({ text: "🗑", callback_data: `sb:del:${s.id}` });
+    inlineKeyboard.push(row);
+  }
+  return {
+    richMsg: { html: blocks.join("\n"), is_rtl: true },
+    fallbackHtml: fallbackLines.join("\n\n"),
+    fallbackExtra: { reply_markup: { inline_keyboard: inlineKeyboard } },
+  };
+}
+
+async function renderWakeupsView(stub) {
+  const slots = await stub.listWakeSchedule();
+  if (!slots.length) {
+    return {
+      richMsg: { html: "<p>هیچ زمان بیدارباشی ثبت نشده.</p>", is_rtl: true },
+      fallbackHtml: "هیچ زمان بیدارباشی ثبت نشده.",
+      fallbackExtra: {},
+    };
+  }
+  const blocks = ["<h3>⏰ زمان‌بندی بیدارباش‌های خودکار</h3>"];
+  const fallbackLines = [];
+  const inlineKeyboard = [];
+  for (const s of slots) {
+    blocks.push(
+      `<p>${s.enabled ? "⏰" : "⛔"} <b>[${s.id}] ${escapeHtml(s.time_hhmm)}</b> — ${escapeHtml(s.theme)}</p>` +
+      `<tg-button-row align="left">` +
+      (s.enabled
+        ? `<tg-button type="callback_data" data="wake:toggle:${s.id}:0">⛔ غیرفعال</tg-button>`
+        : `<tg-button type="callback_data" style="success" data="wake:toggle:${s.id}:1">✅ فعال</tg-button>`) +
+      `<tg-button type="callback_data" style="danger" data="wake:del:${s.id}">🗑 حذف</tg-button>` +
+      `</tg-button-row>`
+    );
+    fallbackLines.push(`${s.enabled ? "⏰" : "⛔"} <b>[${s.id}] ${escapeHtml(s.time_hhmm)}</b> — ${escapeHtml(s.theme)}`);
+    inlineKeyboard.push([
+      { text: s.enabled ? `⛔ [${s.id}] غیرفعال` : `✅ [${s.id}] فعال`, callback_data: `wake:toggle:${s.id}:${s.enabled ? 0 : 1}` },
+      { text: "🗑 حذف", callback_data: `wake:del:${s.id}` },
+    ]);
+  }
+  return {
+    richMsg: { html: blocks.join("\n"), is_rtl: true },
+    fallbackHtml: fallbackLines.join("\n"),
+    fallbackExtra: { reply_markup: { inline_keyboard: inlineKeyboard } },
+  };
+}
+
+async function renderSkillsView(stub) {
+  const skills = await stub.listSkills({ enabledOnly: false });
+  if (!skills.length) {
+    return {
+      richMsg: { html: "<p>هیچ skillای ثبت نشده.</p>", is_rtl: true },
+      fallbackHtml: "هیچ skillای ثبت نشده.",
+      fallbackExtra: {},
+    };
+  }
+  const blocks = ["<h3>🧩 لیست Skillهای ثبت‌شده</h3>"];
+  const fallbackLines = [];
+  const inlineKeyboard = [];
+  for (const s of skills) {
+    blocks.push(
+      `<p>${s.enabled ? "✅" : "⛔"} <b>${escapeHtml(s.name)}</b><br>${escapeHtml(s.description)}</p>` +
+      `<tg-button-row align="left">` +
+      (s.enabled
+        ? `<tg-button type="callback_data" data="skill:toggle:${s.id}:0">⛔ غیرفعال</tg-button>`
+        : `<tg-button type="callback_data" style="success" data="skill:toggle:${s.id}:1">✅ فعال</tg-button>`) +
+      `<tg-button type="callback_data" style="danger" data="skill:del:${s.id}">🗑 حذف</tg-button>` +
+      `</tg-button-row>`
+    );
+    fallbackLines.push(`${s.enabled ? "✅" : "⛔"} <b>${escapeHtml(s.name)}</b>\n${escapeHtml(s.description)}`);
+    inlineKeyboard.push([
+      { text: s.enabled ? `⛔ ${s.name}` : `✅ ${s.name}`, callback_data: `skill:toggle:${s.id}:${s.enabled ? 0 : 1}` },
+      { text: "🗑 حذف", callback_data: `skill:del:${s.id}` },
+    ]);
+  }
+  return {
+    richMsg: { html: blocks.join("\n"), is_rtl: true },
+    fallbackHtml: fallbackLines.join("\n\n"),
+    fallbackExtra: { reply_markup: { inline_keyboard: inlineKeyboard } },
+  };
 }
 
 async function handleNoteCallback(env, stub, callbackQuery) {
@@ -618,14 +892,107 @@ async function handleNoteCallback(env, stub, callbackQuery) {
   const messageId = callbackQuery.message?.message_id;
 
   if (data.startsWith("agent_model:") && chatId && messageId) {
-    const selectedModel = data.split(":")[1];
+    const selectedModel = data.slice("agent_model:".length);
     await stub.setMeta("selected_chat_model", selectedModel);
     await editMessage(env, chatId, messageId, `🎯 مدل فعال چت با موفقیت به <b>${escapeHtml(selectedModel)}</b> تغییر یافت.`);
     await answerCallbackQuery(env, callbackQuery.id, `تغییر به ${selectedModel}`);
     return;
   }
 
-  if (!data.startsWith("note:") || !chatId || !messageId) {
+  if (!chatId || !messageId) {
+    await answerCallbackQuery(env, callbackQuery.id);
+    return;
+  }
+
+  if (data.startsWith("todo:")) {
+    const [, action, idStr] = data.split(":");
+    const id = parseInt(idStr, 10);
+    if (action === "done" && id) {
+      await stub.updateTodo(id, { status: "done" });
+      const view = await renderTodosView(stub);
+      await editRichOrFallback(env, chatId, messageId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
+      await answerCallbackQuery(env, callbackQuery.id, "انجام شد ✅");
+      return;
+    }
+    if (action === "del" && id) {
+      await stub.deleteTodo(id);
+      const view = await renderTodosView(stub);
+      await editRichOrFallback(env, chatId, messageId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
+      await answerCallbackQuery(env, callbackQuery.id, "حذف شد 🗑");
+      return;
+    }
+  }
+
+  if (data.startsWith("sb:")) {
+    const [, action, idStr, val] = data.split(":");
+    const id = parseInt(idStr, 10);
+    const sb = id ? await stub.getSandboxById(id) : null;
+    if (!sb) {
+      await answerCallbackQuery(env, callbackQuery.id, "سندباکس پیدا نشد.");
+      return;
+    }
+    if (action === "main") {
+      await stub.setMainSandbox(sb.code);
+      const view = await renderSandboxesView(stub);
+      await editRichOrFallback(env, chatId, messageId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
+      await answerCallbackQuery(env, callbackQuery.id, "سندباکس اصلی شد ⭐");
+      return;
+    }
+    if (action === "toggle") {
+      await stub.addSandbox({ code: sb.code, vmId: sb.vm_id, description: sb.description, enabled: val === "1" });
+      const view = await renderSandboxesView(stub);
+      await editRichOrFallback(env, chatId, messageId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
+      await answerCallbackQuery(env, callbackQuery.id, val === "1" ? "فعال شد ✅" : "غیرفعال شد ⛔");
+      return;
+    }
+    if (action === "del") {
+      await stub.deleteSandbox(sb.code);
+      const view = await renderSandboxesView(stub);
+      await editRichOrFallback(env, chatId, messageId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
+      await answerCallbackQuery(env, callbackQuery.id, "حذف شد 🗑");
+      return;
+    }
+  }
+
+  if (data.startsWith("wake:")) {
+    const [, action, idStr, val] = data.split(":");
+    const id = parseInt(idStr, 10);
+    if (action === "toggle" && id) {
+      await stub.toggleWakeSlot(id, val === "1");
+      const view = await renderWakeupsView(stub);
+      await editRichOrFallback(env, chatId, messageId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
+      await answerCallbackQuery(env, callbackQuery.id, val === "1" ? "فعال شد ✅" : "غیرفعال شد ⛔");
+      return;
+    }
+    if (action === "del" && id) {
+      await stub.deleteWakeSlot(id);
+      const view = await renderWakeupsView(stub);
+      await editRichOrFallback(env, chatId, messageId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
+      await answerCallbackQuery(env, callbackQuery.id, "حذف شد 🗑");
+      return;
+    }
+  }
+
+  if (data.startsWith("skill:")) {
+    const [, action, idStr, val] = data.split(":");
+    const id = parseInt(idStr, 10);
+    if (action === "toggle" && id) {
+      await stub.toggleSkill(id, val === "1");
+      const view = await renderSkillsView(stub);
+      await editRichOrFallback(env, chatId, messageId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
+      await answerCallbackQuery(env, callbackQuery.id, val === "1" ? "فعال شد ✅" : "غیرفعال شد ⛔");
+      return;
+    }
+    if (action === "del" && id) {
+      await stub.deleteSkillById(id);
+      const view = await renderSkillsView(stub);
+      await editRichOrFallback(env, chatId, messageId, view.richMsg, view.fallbackHtml, view.fallbackExtra);
+      await answerCallbackQuery(env, callbackQuery.id, "حذف شد 🗑");
+      return;
+    }
+  }
+
+  if (!data.startsWith("note:")) {
     await answerCallbackQuery(env, callbackQuery.id);
     return;
   }
@@ -635,9 +1002,21 @@ async function handleNoteCallback(env, stub, callbackQuery) {
 
   if (action === "page") {
     const page = parseInt(parts[2], 10) || 1;
-    const { text, reply_markup } = await renderNotesPageData(stub, page);
-    await editMessage(env, chatId, messageId, text, reply_markup ? { reply_markup } : {});
+    const [richMsg, fallback] = await Promise.all([renderNotesPageRich(stub, page), renderNotesPageData(stub, page)]);
+    await editRichOrFallback(env, chatId, messageId, richMsg, fallback.text, fallback.reply_markup ? { reply_markup: fallback.reply_markup } : {});
     await answerCallbackQuery(env, callbackQuery.id);
+    return;
+  }
+
+  if (action === "del") {
+    const noteId = parseInt(parts[2], 10);
+    const returnPage = parseInt(parts[3], 10) || 1;
+    if (noteId) {
+      await stub.deleteNote(noteId);
+    }
+    const [richMsg, fallback] = await Promise.all([renderNotesPageRich(stub, returnPage), renderNotesPageData(stub, returnPage)]);
+    await editRichOrFallback(env, chatId, messageId, richMsg, fallback.text, fallback.reply_markup ? { reply_markup: fallback.reply_markup } : {});
+    await answerCallbackQuery(env, callbackQuery.id, "یادداشت حذف شد 🗑");
     return;
   }
 
@@ -656,11 +1035,22 @@ async function handleNoteCallback(env, stub, callbackQuery) {
     const updatedStr = new Date(note.updated_at).toLocaleString("fa-IR", { timeZone: "Asia/Tehran" });
 
     if (note.body.length <= 3500) {
+      const richMsg = {
+        html:
+          `<h3>📝 ${escapeHtml(note.title)}</h3>` +
+          `<p><i>ایجاد: ${escapeHtml(createdStr)} | ویرایش: ${escapeHtml(updatedStr)}</i></p>` +
+          `<p>${escapeHtml(note.body).replace(/\n/g, "<br/>")}</p>` +
+          `<tg-button-row align="left">` +
+          `<tg-button type="callback_data" style="primary" data="note:page:${returnPage}">⬅️ بازگشت به لیست</tg-button>` +
+          `<tg-button type="callback_data" style="danger" data="note:del:${noteId}:${returnPage}">🗑 حذف</tg-button>` +
+          `</tg-button-row>`,
+        is_rtl: true,
+      };
       const fullText = `📝 <b>${escapeHtml(note.title)}</b>\n<i>ایجاد: ${createdStr} | ویرایش: ${updatedStr}</i>\n\n${escapeHtml(note.body)}`;
       const reply_markup = {
         inline_keyboard: [[{ text: "⬅️ بازگشت به لیست", callback_data: `note:page:${returnPage}` }]],
       };
-      await editMessage(env, chatId, messageId, fullText, { reply_markup });
+      await editRichOrFallback(env, chatId, messageId, richMsg, fullText, { reply_markup });
     } else {
       await sendMarkdown(
         env,

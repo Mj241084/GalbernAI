@@ -4,7 +4,6 @@ import * as memory from "./memory.js";
 import * as web from "./web.js";
 import * as tts from "./tts.js";
 import * as skills from "./skills.js";
-import * as images from "./images.js";
 import * as notes from "./notes.js";
 import * as sandbox from "./sandbox.js";
 import * as vision from "./vision.js";
@@ -12,7 +11,7 @@ import { timeoutForTool } from "../config.js";
 import { withTimeout } from "../util.js";
 import { sendOwnerAlert } from "../telegram.js";
 
-const MODULES = [todos, plan, memory, web, tts, skills, images, notes, sandbox, vision];
+const MODULES = [todos, plan, memory, web, tts, skills, notes, sandbox, vision];
 
 export function allToolDefinitions() {
   const rawDefs = MODULES.flatMap((m) => m.definitions);
@@ -27,7 +26,7 @@ export function allToolDefinitions() {
       params.properties.report_message = {
         type: "string",
         description:
-          "یک جمله‌ی کوتاه و صمیمانه به فارسی که دقیقاً بگه همین الان با این ابزار چیکار داری می‌کنی - عیناً همون جمله‌ای که توی content خودت هم نوشتی. این مستقیم پیام وضعیت زنده‌ی تلگرام کاربر می‌شه، پس هیچ‌وقت خالی نذارش. مثال: «دارم کدهای پایتون رو توی لینوکس امن اجرا می‌کنم تا نمودار رو برات بکشم...»"
+          "یک جمله‌ی کوتاه و صمیمانه به فارسی که دقیقاً بگه همین الان با این ابزار چیکار داری می‌کنی. این مستقیم پیام وضعیت زنده‌ی تلگرام کاربر می‌شه، پس هیچ‌وقت خالی نذارش (و متن پیام content رو هم برای ابزار صدا زدن خالی بذار). مثال: «دارم کدهای پایتون رو توی لینوکس امن اجرا می‌کنم تا نمودار رو برات بکشم...»"
       };
       params.required = params.required || [];
       if (!params.required.includes("report_message")) {

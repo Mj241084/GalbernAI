@@ -7,7 +7,9 @@ export const definitions = [
     type: "function",
     function: {
       name: "web_search",
-      description: "Search the web for current information.",
+      description:
+        "Search the web for current information. " +
+        "WHEN NOT TO USE: Do NOT search for stable general knowledge, private user facts/notes/history (check search_notes / search_memory first), or when the user already gave a specific URL (use web_extract instead).",
       parameters: {
         type: "object",
         properties: {

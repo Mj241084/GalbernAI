@@ -69,4 +69,4 @@ AI_ROUTER_BASE_URL = "https://gemini-hermes-router.matghz24.workers.dev"
 # TAVILY_API_KEY          -> for web_search
 # FIRECRAWL_API_KEY       -> for web_extract
 # YOUTUBE_API_KEY         -> removed
-# SERPER_API_KEY          -> for find_images (Serper Images search)
+# SERPER_API_KEY          -> for sandbox image search (imgsearch.py provisioning)

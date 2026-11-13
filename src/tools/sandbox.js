@@ -1,4 +1,4 @@
-import { sendPhoto, sendDocument } from "../telegram.js";
+import { sendPhoto, sendDocument, sendMediaGroup, sendRichMediaGallery } from "../telegram.js";
 import { bytesToBase64 } from "../util.js";
 import { freestyleReadFile, freestyleWriteFile, freestyleExec } from "../freestyleClient.js";
 
@@ -33,7 +33,9 @@ export const definitions = [
     type: "function",
     function: {
       name: "get_sandbox_file",
-      description: "یک فایل را از داخل محیط سندباکس خوانده و آن را مستقیماً برای کاربر در تلگرام ارسال می‌کند یا محتوای آن را برمی‌گرداند.",
+      description:
+        "یک فایل تکی را از داخل محیط سندباکس خوانده و مستقیماً برای کاربر در تلگرام ارسال می‌کند. " +
+        "WHEN NOT TO USE: برای ارسال ۲ فایل یا بیشتر (مثلاً چند عکس یا چند خروجی) هرگز از این ابزار به‌صورت پشت‌سرهم استفاده نکن — به‌جایش از send_sandbox_files استفاده کن. همچنین برای دیدن تصویر توسط خودت، از look استفاده کن نه این ابزار.",
       parameters: {
         type: "object",
         properties: {
@@ -55,6 +57,39 @@ export const definitions = [
           }
         },
         required: ["path"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "send_sandbox_files",
+      description:
+        "چندین فایل را از محیط سندباکس می‌خواند و برای کاربر ارسال می‌کند. عکس‌ها تا ۲۰تایی به‌صورت اسلایدشو (یا کلاژ/آلبوم) و سایر فایل‌ها به‌صورت سند ارسال می‌شوند. " +
+        "WHEN NOT TO USE: برای ارسال یک فایل تکی که نیاز به کپشن/کنترل تکی دارد از get_sandbox_file استفاده کن.",
+      parameters: {
+        type: "object",
+        properties: {
+          paths: {
+            type: "array",
+            items: { type: "string" },
+            description: "آرایه‌ای از مسیرهای کامل فایل‌ها در سندباکس"
+          },
+          caption: {
+            type: "string",
+            description: "توضیح یا کپشنی که همراه گالری/آلبوم/فایل‌ها در تلگرام فرستاده می‌شود (اختیاری)"
+          },
+          display: {
+            type: "string",
+            enum: ["slideshow", "collage", "album"],
+            description: "نحوه‌ی نمایش چند عکس: slideshow (اسلایدشو، پیش‌فرض برای ۲ عکس یا بیشتر)، collage (کلاژ/شبکه)، یا album (آلبوم کلاسیک ۱۰تایی تلگرام)"
+          },
+          sandbox_code: {
+            type: "string",
+            description: "کد سندباکس (اختیاری - پیش‌فرض: سندباکس اصلی)"
+          }
+        },
+        required: ["paths"]
       }
     }
   }
@@ -185,6 +220,144 @@ export async function execute(name, args, { env, stub, chatId }) {
 
       } catch (err) {
         return { ok: false, error: `خطا در فرآیند دریافت فایل از سندباکس: ${err.message || err}` };
+      }
+    }
+
+    case "send_sandbox_files": {
+      try {
+        const paths = args.paths;
+        if (!Array.isArray(paths) || paths.length === 0) {
+          return { ok: false, error: "پارامتر paths باید یک آرایه‌ی غیرخالی از مسیرها باشد." };
+        }
+        if (paths.length > 40) {
+          return { ok: false, error: "تعداد مسیرها خیلی زیاده (حداکثر ۴۰ مورد مجازه)، لطفاً در چند فراخوانی بفرست." };
+        }
+
+        const photoPaths = [];
+        const docPaths = [];
+        for (const rawPath of paths) {
+          const filePath = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+          const filename = filePath.split("/").pop() || "file.bin";
+          const ext = filename.split(".").pop().toLowerCase();
+          if (["jpg", "jpeg", "png", "webp", "gif"].includes(ext)) {
+            photoPaths.push(rawPath);
+          } else {
+            docPaths.push(rawPath);
+          }
+        }
+
+        const failed = [];
+        let sentCount = 0;
+
+        const readOne = async (rawPath) => {
+          const filePath = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+          try {
+            const fileResp = await freestyleReadFile(env, vmId, filePath);
+            if (!fileResp.ok) {
+              return { error: `HTTP status ${fileResp.status}`, path: rawPath };
+            }
+            const buf = await fileResp.arrayBuffer();
+            if (buf.byteLength === 0) {
+              return { error: "فایل خالی است (۰ بایت)", path: rawPath };
+            }
+            const filename = filePath.split("/").pop() || "file.bin";
+            const mimeType = mimeFromExtension(filePath);
+            const bytes = new Uint8Array(buf);
+            return { path: rawPath, bytes, filename, mimeType };
+          } catch (err) {
+            return { error: err.message || String(err), path: rawPath };
+          }
+        };
+
+        const display = args.display || "slideshow";
+        const photoBatchSize = display === "album" ? 10 : 20;
+
+        // ارسال عکس‌ها در دسته‌های ۲۰تایی (Rich UI) یا ۱۰تایی (آلبوم کلاسیک)
+        for (let i = 0; i < photoPaths.length; i += photoBatchSize) {
+          const slice = photoPaths.slice(i, i + photoBatchSize);
+          const loadedResults = await Promise.all(slice.map(readOne));
+          const validPhotos = [];
+          for (const item of loadedResults) {
+            if (item.error) {
+              failed.push({ path: item.path, error: item.error });
+            } else {
+              validPhotos.push(item);
+            }
+          }
+
+          if (validPhotos.length === 1) {
+            const only = validPhotos[0];
+            const res = await sendPhoto(env, chatId, {
+              base64: bytesToBase64(only.bytes),
+              mimeType: only.mimeType,
+              caption: (sentCount === 0 && args.caption) ? args.caption : undefined,
+            });
+            if (res && res.ok) {
+              sentCount++;
+            } else {
+              failed.push({ path: only.path, error: `sendPhoto failed: ${JSON.stringify(res)}` });
+            }
+          } else if (validPhotos.length > 1) {
+            if (display === "album") {
+              const items = validPhotos.map((item, idx) => ({
+                bytes: item.bytes,
+                mimeType: item.mimeType,
+                filename: item.filename,
+                caption: (sentCount === 0 && idx === 0 && args.caption) ? args.caption : undefined,
+              }));
+              const res = await sendMediaGroup(env, chatId, items);
+              if (res && res.ok) {
+                sentCount += validPhotos.length;
+              } else {
+                validPhotos.forEach((item) => failed.push({ path: item.path, error: `sendMediaGroup failed: ${JSON.stringify(res)}` }));
+              }
+            } else {
+              const mode = display === "collage" ? "collage" : "slideshow";
+              const items = validPhotos.map((item) => ({
+                bytes: item.bytes,
+                mimeType: item.mimeType,
+                filename: item.filename,
+              }));
+              const res = await sendRichMediaGallery(env, chatId, items, {
+                mode,
+                caption: (sentCount === 0 && args.caption) ? args.caption : undefined,
+              });
+              if (res && res.ok) {
+                sentCount += validPhotos.length;
+              } else {
+                validPhotos.forEach((item) => failed.push({ path: item.path, error: `sendRichMediaGallery failed: ${JSON.stringify(res)}` }));
+              }
+            }
+          }
+        }
+
+        // ارسال فایل‌های غیرعکس تک‌تک با خواندن و آزادسازی فوری
+        for (const docPath of docPaths) {
+          const item = await readOne(docPath);
+          if (item.error) {
+            failed.push({ path: item.path, error: item.error });
+            continue;
+          }
+          const res = await sendDocument(env, chatId, {
+            bytes: item.bytes,
+            mimeType: item.mimeType,
+            filename: item.filename,
+            caption: args.caption && sentCount === 0 ? args.caption : undefined,
+          });
+          if (res && res.ok) {
+            sentCount++;
+          } else {
+            failed.push({ path: item.path, error: `sendDocument failed: ${JSON.stringify(res)}` });
+          }
+        }
+
+        if (sentCount === 0) {
+          return { ok: false, sent: 0, failed };
+        }
+        return { ok: true, sent: sentCount, failed };
+
+      } catch (err) {
+        return { ok: false, error: `خطا در اجرای send_sandbox_files: ${err.message || err}` };
       }
     }
 

@@ -7,7 +7,8 @@ export const definitions = [
     function: {
       name: "speak",
       description:
-        "Convert text to a spoken voice message and send it DIRECTLY to the user (with the transcript in a collapsed/expandable quote below it). Do not repeat the text yourself in your own reply - the tool already delivers it.",
+        "Convert text to a spoken voice message and send it DIRECTLY to the user (with the transcript in a collapsed/expandable quote below it). Do not repeat the text yourself in your own reply - the tool already delivers it. " +
+        "WHEN NOT TO USE: Do NOT use speak for code blocks, URLs, tables, or multi-line structured data, or when text alone is clearly faster/clearer and the user didn't ask for voice.",
       parameters: {
         type: "object",
         properties: {

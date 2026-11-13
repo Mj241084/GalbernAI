@@ -1,5 +1,5 @@
-import { BASE_SYSTEM_PROMPT, CHAT_MODEL, MAX_TOOL_ITERATIONS, TURN_SOFT_DEADLINE_MS, statusTextFor } from "./config.js";
-import { currentTimeBlock, getDayWindow, safeJsonParse, escapeHtml } from "./util.js";
+import { BASE_SYSTEM_PROMPT, CHAT_MODEL, MAX_TOOL_ITERATIONS, TURN_SOFT_DEADLINE_MS, statusTextFor, PROACTIVE_GUIDELINES } from "./config.js";
+import { currentTimeBlock, formatMessageTimestamp, formatNumberedLines, getDayWindow, safeJsonParse, escapeHtml } from "./util.js";
 import { callChatCompletions } from "./aiRouter.js";
 import { allToolDefinitions, dispatchTool } from "./tools/index.js";
 import { downloadTelegramFile, sendMessage, sendMarkdown, editMessage, deleteMessage, sendOwnerAlert } from "./telegram.js";
@@ -21,6 +21,27 @@ function guessFilename(ref) {
   return `file_${Date.now()}.${ext}`;
 }
 
+async function transcribeAudioRef(env, ref) {
+  const { base64, mimeType } = await downloadTelegramFile(env, ref.fileId);
+  const resp = await callChatCompletions(env, {
+    model: "fast",
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text:
+          "این فایل صوتی رو دقیق و کلمه‌به‌کلمه به متن تبدیل کن. فقط خودِ متن نهایی رو برگردون — " +
+          "بدون مقدمه، بدون توضیح، بدون برچسب، بدون علامت نقل‌قول. زبان خروجی همون زبان گفتاره. " +
+          "اصطلاحات تخصصی و نام‌های فنی انگلیسی رو با همون خط انگلیسی بنویس و الکی ترجمه یا فارسی‌نویسی نکن. " +
+          "اگه هیچ گفتار قابل‌تشخیصی نبود، دقیقاً بنویس: [بدون گفتار قابل تشخیص]" },
+        { type: "input_audio", input_audio: { data: base64, mimeType: mimeType || ref.mimeType || "audio/ogg" } },
+      ],
+    }],
+  });
+  const text = resp.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error("مدل متن خالی برگردوند");
+  return text;
+}
+
 export async function saveIncomingFileToMainSandbox(env, stub, ref) {
   const mainSandbox = await stub.getMainSandbox();
   if (!mainSandbox) throw new Error("هیچ سندباکس اصلی ثبت نشده - با /setmainsandbox یکی رو مشخص کن.");
@@ -37,35 +58,51 @@ export async function saveIncomingFileToMainSandbox(env, stub, ref) {
 // System prompt assembly
 // ===========================================================================
 
-async function buildSystemPrompt(stub) {
-  const [memoryProfile, planBlock, skills, currentRollup, sandboxes] = await Promise.all([
+export async function buildSystemPrompt(stub) {
+  const [memoryProfile, planBlock, skills, currentRollup, sandboxes, notesIndex] = await Promise.all([
     stub.getMemoryProfile(),
     stub.renderPlanBlock(),
     stub.listSkills(),
     stub.getCurrentRollup(),
     stub.listSandboxes(),
+    stub.listNotesIndex(),
   ]);
 
-  const sections = [BASE_SYSTEM_PROMPT, currentTimeBlock()];
+  const sections = [BASE_SYSTEM_PROMPT, `<clock>\n${currentTimeBlock()}\n</clock>`];
 
   if (memoryProfile) {
-    sections.push(`--- حافظه‌ی بلندمدت درباره‌ی کاربر ---\n${memoryProfile}`);
+    sections.push(
+      `<user_profile note="شماره‌گذاری خطوط (N | ) فقط برای خواندن و آدرس‌دهی patch_memory است؛ هرگز این پیشوندها را در پچ یا پاسخ کپی نکن">\n${formatNumberedLines(memoryProfile)}\n</user_profile>`
+    );
+  }
+  if (notesIndex && notesIndex.length) {
+    const lines = notesIndex.map((n) => {
+      const d = new Date(n.updated_at).toLocaleDateString("fa-IR", { timeZone: "Asia/Tehran" });
+      return `- [${n.id}] ${n.title}${n.tags ? ` — تگ: ${n.tags}` : ""} (${d})`;
+    }).join("\n");
+    sections.push(
+      `<notes_index count="${notesIndex.length}" hint="برای متن کامل get_note و برای جستجو search_notes">\n${lines}\n</notes_index>`
+    );
   }
   if (skills.length) {
     const skillLines = skills.map((s) => `- ${s.name}: ${s.description}`).join("\n");
-    sections.push(`--- Skillهای موجود (برای دیدن متن کامل هرکدوم از view_skill استفاده کن) ---\n${skillLines}`);
+    sections.push(
+      `<available_skills hint="قبل از انجام کار مرتبط، حتماً view_skill بزن">\n${skillLines}\n</available_skills>`
+    );
   }
   if (sandboxes.length) {
     const lines = sandboxes.map((s) => `- ${s.code}${s.is_main ? " (پیش‌فرض/اصلی)" : ""}: ${s.description || "بدون توضیح"}`).join("\n");
-    sections.push(`--- سندباکس‌های موجود (برای run_code_sandbox / get_sandbox_file / look از پارامتر sandbox_code استفاده کن؛ اگه ندی، سندباکس اصلی استفاده می‌شه) ---\n${lines}`);
+    sections.push(
+      `<sandboxes hint="برای run_code_sandbox / get_sandbox_file / send_sandbox_files / look از پارامتر sandbox_code استفاده کن (پیش‌فرض: سندباکس اصلی)">\n${lines}\n</sandboxes>`
+    );
   }
   if (currentRollup) {
     sections.push(
-      `--- خلاصه‌ی فشرده‌ی مکالمات قدیمی‌تر (${currentRollup.covers_from_day} تا ${currentRollup.covers_to_day}) ---\n${currentRollup.summary}`
+      `<older_rollup from="${currentRollup.covers_from_day}" to="${currentRollup.covers_to_day}">\n${currentRollup.summary}\n</older_rollup>`
     );
   }
   if (planBlock) {
-    sections.push(`--- ${planBlock}`);
+    sections.push(`<active_plan>\n${planBlock}\n</active_plan>`);
   }
 
   return sections.join("\n\n");
@@ -97,13 +134,15 @@ async function resolveMediaContentPart(env, stub, ref) {
   return { type: "image_url", image_url: { url: `data:${cached.mimeType};base64,${cached.base64}` } };
 }
 
-async function buildHistoryMessages(stub, env) {
+export async function buildHistoryMessages(stub, env) {
   const rows = await stub.getTodayAndYesterday();
   const messages = [];
   for (const row of rows) {
+    const tsPrefix = formatMessageTimestamp(row.ts);
     if (row.role === "user") {
       const content = [];
-      if (row.content) content.push({ type: "text", text: row.content });
+      const textBody = row.content ? `${tsPrefix}\n${row.content}` : tsPrefix;
+      content.push({ type: "text", text: textBody });
       const mediaRefs = safeJsonParse(row.media_refs, []);
       if (mediaRefs && mediaRefs.length) {
         const parts = await Promise.all(
@@ -111,9 +150,7 @@ async function buildHistoryMessages(stub, env) {
             resolveMediaContentPart(env, stub, ref).catch(async (err) => {
               await sendOwnerAlert(
                 env,
-                `⚠️ <b>یک فایل رسانه‌ای در بازسازی تاریخچه رد شد</b>
-kind: ${ref.kind}
-<code>${String(err.message || err).slice(0, 1000)}</code>`
+                `⚠️ <b>یک فایل رسانه‌ای در بازسازی تاریخچه رد شد</b>\nkind: ${ref.kind}\n<code>${String(err.message || err).slice(0, 1000)}</code>`
               );
               return null;
             })
@@ -126,8 +163,10 @@ kind: ${ref.kind}
         content: content.length === 1 && content[0].type === "text" ? content[0].text : content,
       });
     } else if (row.role === "assistant") {
-      const msg = { role: "assistant", content: row.content || "" };
       const toolCalls = safeJsonParse(row.tool_calls, null);
+      const rawText = row.content || "";
+      const text = rawText.trim() ? `${tsPrefix}\n${rawText}` : "";
+      const msg = { role: "assistant", content: text };
       if (toolCalls) msg.tool_calls = toolCalls;
       messages.push(msg);
     } else if (row.role === "tool") {
@@ -264,7 +303,7 @@ function cleanCommonLogs(text) {
     .replace(/(?:^|\n)(?:frame=\s*\d+\s+fps=[\s\S]*?\r?\n){3,}/g, "\n[لاگ رندر فریم‌های ffmpeg خلاصه‌شد]\n");
 }
 
-async function compressSandboxResult(env, resultPayload) {
+export async function compressSandboxResult(env, resultPayload) {
   if (!resultPayload?.ok) return resultPayload;
 
   // گارد ساختاری: اگر stdout خودش یک JSON کامله (خروجی CLIها مثل OfficeCLI)، دست‌نخورده برگردان
@@ -308,7 +347,7 @@ async function compressSandboxResult(env, resultPayload) {
 - کارت انتخابِ کدوم خط بمونه‌ست، نه بازنویسیِ محتوا با کلمات خودت.
 
 خروجی خام:
-${combined.slice(0, 50000)}`;
+${combined}`;
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
@@ -356,12 +395,31 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger, dedu
   const turnStartedAt = Date.now();
   logSafe(stub, { kind: "turn_start", status: "ok", detail: trigger.kind });
 
+  const status = new StatusPing(env, stub, chatId);
+  if (trigger.kind === "user_message") {
+    await status.showInitialThinking();
+  }
+
   if (trigger.kind === "user_message") {
     let text = trigger.text || "";
     const imageRefs = [];
     for (const ref of trigger.mediaRefs || []) {
       if (ref.kind === "image") {
         imageRefs.push(ref);
+        continue;
+      }
+      if (ref.kind === "audio") {
+        if (ref.fileSize && ref.fileSize > 20 * 1024 * 1024) {
+          text += `\n⚠️ کاربر یک فایل صوتی حجیم فرستاد (>20MB) که قابل دانلود نیست.`;
+          continue;
+        }
+        await status.update("transcribe_voice");
+        try {
+          const transcript = await transcribeAudioRef(env, ref);
+          text += `${text ? "\n" : ""}🎤 [پیام صوتی کاربر، متن استخراج‌شده]: ${transcript}`;
+        } catch (err) {
+          text += `\n⚠️ کاربر یک پیام صوتی فرستاد ولی تبدیلش به متن شکست خورد (${String(err.message || err).slice(0, 200)}). ازش بخواه دوباره بفرسته یا تایپ کنه.`;
+        }
         continue;
       }
       try {
@@ -371,7 +429,7 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger, dedu
         text += `\n⚠️ فایل (${ref.kind}) دریافت شد ولی ذخیره در سندباکس با خطا مواجه شد: ${String(err.message || err)}`;
       }
     }
-    stub.appendMessage({
+    await stub.appendMessage({
       dayWindow: today,
       role: "user",
       content: text,
@@ -379,18 +437,18 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger, dedu
     });
   } else if (trigger.kind === "todo_fired") {
     const syntheticId = `todo_fired_${trigger.todo.id}_${Date.now()}`;
-    stub.appendMessage({
+    await stub.appendMessage({
       dayWindow: today,
       role: "user",
       content: "⏰ [یادآوری خودکار]",
     });
-    stub.appendMessage({
+    await stub.appendMessage({
       dayWindow: today,
       role: "assistant",
       content: "",
       toolCalls: [{ id: syntheticId, type: "function", function: { name: "todo_check", arguments: "{}" } }],
     });
-    stub.appendMessage({
+    await stub.appendMessage({
       dayWindow: today,
       role: "tool",
       toolCallId: syntheticId,
@@ -399,23 +457,23 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger, dedu
     });
   } else if (trigger.kind === "proactive_wake") {
     const syntheticId = `proactive_${Date.now()}`;
-    stub.appendMessage({
+    await stub.appendMessage({
       dayWindow: today,
       role: "user",
       content: "⏰ [بیدارباش خودکار]",
     });
-    stub.appendMessage({
+    await stub.appendMessage({
       dayWindow: today,
       role: "assistant",
       content: "",
       toolCalls: [{ id: syntheticId, type: "function", function: { name: "proactive_wake", arguments: "{}" } }],
     });
-    stub.appendMessage({
+    await stub.appendMessage({
       dayWindow: today,
       role: "tool",
       toolCallId: syntheticId,
       toolName: "proactive_wake",
-      content: `⏰ الان یکی از زمان‌های بیدارشدن خودکاره. موضوعی که خودت برای این ساعت تعیین کرده بودی: «${trigger.theme}».\nبر همین اساس (با کمک web_search و/یا حافظه‌ی بلندمدت در صورت نیاز) تصمیم بگیر چیکار کنی؛ اگه چیزی برای گفتن پیدا کردی بفرست، وگرنه لازم نیست هرقیمتی پیام بدی.`,
+      content: `⏰ الان یکی از زمان‌های بیدارشدن خودکاره. موضوعی که برای این ساعت تعیین شده بود: «${trigger.theme}».\n${PROACTIVE_GUIDELINES}\nبر همین اساس تصمیم بگیر...`,
     });
   } else if (trigger.kind === "continue_turn") {
     // هیچ پیام جدیدی به تاریخچه اضافه نمی‌شود - فقط در این invocation ادامه داده می‌شود.
@@ -425,10 +483,6 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger, dedu
   const history = await buildHistoryMessages(stub, env);
   const messages = [{ role: "system", content: systemPrompt }, ...history];
 
-  const status = new StatusPing(env, stub, chatId);
-  if (trigger.kind === "user_message") {
-    await status.showInitialThinking();
-  }
   const toolContext = { env, ctx, stub, chatId };
 
   let finalText = null;
@@ -464,14 +518,17 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger, dedu
 
     if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
       messages.push({ role: "assistant", content: message.content || "", tool_calls: message.tool_calls });
-      stub.appendMessage({
+      await stub.appendMessage({
         dayWindow: today,
         role: "assistant",
         content: message.content || "",
         toolCalls: message.tool_calls,
       });
 
-      if (message.content && message.content.trim()) {
+      const firstReport = message.tool_calls[0]?.function?.arguments
+        ? safeJsonParse(message.tool_calls[0].function.arguments, {})?.report_message?.trim()
+        : null;
+      if (message.content && message.content.trim() && message.content.trim() !== firstReport) {
         await status.updateThinking(message.content.trim());
       }
 
@@ -486,7 +543,7 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger, dedu
           const errResult = { ok: false, error: "آرگومان‌های ارسالی قابل parse نبودند، دوباره تلاش کن." };
           const resultText = JSON.stringify(errResult);
           messages.push({ role: "tool", tool_call_id: call.id, name: toolName, content: resultText });
-          stub.appendMessage({ dayWindow: today, role: "tool", toolCallId: call.id, toolName, content: resultText });
+          await stub.appendMessage({ dayWindow: today, role: "tool", toolCallId: call.id, toolName, content: resultText });
           continue;
         }
 
@@ -507,7 +564,7 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger, dedu
         }
         const resultText = JSON.stringify(resultPayload);
         messages.push({ role: "tool", tool_call_id: call.id, name: toolName, content: resultText });
-        stub.appendMessage({ dayWindow: today, role: "tool", toolCallId: call.id, toolName, content: resultText });
+        await stub.appendMessage({ dayWindow: today, role: "tool", toolCallId: call.id, toolName, content: resultText });
 
         if (resultPayload?.__pendingImage) {
           const { cacheKey, mimeType } = resultPayload.__pendingImage;
@@ -516,14 +573,13 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger, dedu
           if (imagePart) {
             messages.push({ role: "user", content: [{ type: "text", text: "👁️ [تصویری که ابزار look خوند]" }, imagePart] });
           }
-          stub.appendMessage({ dayWindow: today, role: "user", content: "👁️ [تصویری که ابزار look خوند]", mediaRefs: [imgRef] });
+          await stub.appendMessage({ dayWindow: today, role: "user", content: "👁️ [تصویری که ابزار look خوند]", mediaRefs: [imgRef] });
         }
       }
       continue;
     }
 
     finalText = message.content || "";
-    stub.appendMessage({ dayWindow: today, role: "assistant", content: finalText });
     break;
   }
 
@@ -558,6 +614,17 @@ export async function runAgentTurnLocked({ env, ctx, stub, chatId, trigger, dedu
     }
     return;
   }
+
+  if (finalText.trim() === "[SILENT]") {
+    await stub.appendMessage({
+      dayWindow: today,
+      role: "assistant",
+      content: "[سکوت خودکار — پیامی ارسال نشد]",
+    });
+    logSafe(stub, { kind: "turn_end", status: "ok", detail: "proactive_silent", latencyMs: Date.now() - turnStartedAt });
+    return;
+  }
+  await stub.appendMessage({ dayWindow: today, role: "assistant", content: finalText });
 
   logSafe(stub, { kind: "turn_end", status: "ok", latencyMs: Date.now() - turnStartedAt });
 
